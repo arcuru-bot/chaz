@@ -15,7 +15,7 @@ use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::mcp::server::{McpServer, build_capability_tools};
 use crate::tool::Tool;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// An MCP server wrapped as an extension.
 pub struct McpExtension {
@@ -58,62 +58,70 @@ impl Extension for McpExtension {
         let config = self.config.clone();
         let name = self.name;
         let mcp_registry = scope_ctx.peer().mcp_registry.clone();
+        let tool_registry = scope_ctx.peer().tool_registry.clone();
         Box::pin(async move {
-            // Start the MCP server. If it fails, log and produce an
-            // empty instance — matching the legacy resilience contract.
-            // Either way, register the outcome in `mcp_registry` so the
-            // TUI Peer→MCP settings page can surface failed servers
-            // alongside running ones.
-            let tools: Vec<Arc<dyn Tool>> = match McpServer::start(&config).await {
-                Ok(server) => {
-                    let server = Arc::new(server);
-                    mcp_registry.insert_running(config.name.clone(), server.clone());
-                    let capability_tools = build_capability_tools(server.clone(), &config.name);
-                    match server.discover_and_wrap_tools(&config.name).await {
-                        Ok(t) => {
-                            let count = t.len();
-                            let cap_count = capability_tools.len();
-                            tracing::info!(
-                                server = %config.name,
-                                tools = count,
-                                capability_tools = cap_count,
-                                "MCP server registered as extension"
-                            );
-                            let mut all: Vec<Arc<dyn Tool>> = t
-                                .into_iter()
-                                .map(|tool| Arc::new(tool) as Arc<dyn Tool>)
-                                .collect();
-                            all.extend(capability_tools);
-                            all
-                        }
-                        Err(e) => {
-                            warn!(
-                                server = %config.name,
-                                error = %e,
-                                "MCP server tool discovery failed — skipping"
-                            );
-                            // Resources/prompts wrappers can still work
-                            // even if tools/list failed.
-                            capability_tools
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        server = %config.name,
-                        error = %e,
-                        "MCP server failed to start — skipping its tools"
-                    );
-                    mcp_registry.insert_failed(config.name.clone(), e);
-                    Vec::new()
-                }
-            };
-
-            Ok(Arc::new(McpInstance {
+            // Return immediately with an empty-tools instance. MCP server
+            // startup runs in the background and hot-adds tools when ready.
+            let instance = Arc::new(McpInstance {
                 manifest,
                 _name: name,
-                tools,
-            }) as Arc<dyn ExtensionInstance>)
+                tools: Vec::new(),
+            });
+
+            // Spawn the actual MCP server startup off the critical path.
+            let owner: &'static str = Box::leak(
+                format!("mcp-{}", config.name).into_boxed_str(),
+            );
+            tokio::spawn(async move {
+                match McpServer::start(&config).await {
+                    Ok(server) => {
+                        let server = Arc::new(server);
+                        mcp_registry.insert_running(config.name.clone(), server.clone());
+                        let capability_tools = build_capability_tools(server.clone(), &config.name);
+                        match server.discover_and_wrap_tools(&config.name).await {
+                            Ok(t) => {
+                                let count = t.len();
+                                let cap_count = capability_tools.len();
+                                info!(
+                                    server = %config.name,
+                                    tools = count,
+                                    capability_tools = cap_count,
+                                    "MCP server tools discovered (async)"
+                                );
+                                for tool in t {
+                                    tool_registry.register_arc_owned(
+                                        Arc::new(tool) as Arc<dyn Tool>,
+                                        Some(owner),
+                                    );
+                                }
+                                for tool in capability_tools {
+                                    tool_registry.register_arc_owned(tool, Some(owner));
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    server = %config.name,
+                                    error = %e,
+                                    "MCP server tool discovery failed (async) — skipping"
+                                );
+                                for tool in capability_tools {
+                                    tool_registry.register_arc_owned(tool, Some(owner));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            server = %config.name,
+                            error = %e,
+                            "MCP server failed to start (async) — skipping its tools"
+                        );
+                        mcp_registry.insert_failed(config.name.clone(), e);
+                    }
+                }
+            });
+
+            Ok(instance as Arc<dyn ExtensionInstance>)
         })
     }
 }

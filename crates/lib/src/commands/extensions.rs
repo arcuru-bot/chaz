@@ -436,7 +436,7 @@ mod tests {
         }))
         .await
         .unwrap();
-        let mut tool_registry = ToolRegistry::new();
+        let tool_registry = ToolRegistry::new();
         for (owner, _name, tool) in hub.tools_for_registry() {
             tool_registry.register_arc_owned(tool, Some(owner));
         }
