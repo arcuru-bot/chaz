@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CHAZ_BIN="${CHAZ_BIN:-target/debug/chaz}"
+STUB_LLM="${STUB_LLM:-dev/matrix-e2e/stub_llm.py}"
+WORKSPACE="$(mktemp -d -t chaz-frontend-service-e2e-XXXXXX)"
+STATE="$WORKSPACE/state"
+CONFIG="$WORKSPACE/config.yaml"
+DAEMON_PID=""
+STUB_PID=""
+
+cleanup() {
+	if [[ -n $DAEMON_PID ]]; then
+		kill -TERM "$DAEMON_PID" 2>/dev/null || true
+	fi
+	if [[ -n $STUB_PID ]]; then
+		kill -TERM "$STUB_PID" 2>/dev/null || true
+	fi
+	rm -rf "$WORKSPACE"
+}
+trap cleanup EXIT INT TERM
+
+fail() {
+	printf 'FAIL — %s\n' "$*" >&2
+	exit 1
+}
+
+wait_for() {
+	local what="$1" timeout="$2"
+	shift 2
+	local deadline=$((SECONDS + timeout))
+	while ((SECONDS < deadline)); do
+		if "$@"; then
+			return 0
+		fi
+		sleep 0.05
+	done
+	fail "timed out waiting for $what"
+}
+
+STUB_PORT="$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
+python3 "$STUB_LLM" "$STUB_PORT" "frontend service stub reply" \
+	>"$WORKSPACE/stub-llm.stdout" 2>&1 &
+STUB_PID="$!"
+wait_for "stub LLM" 30 sh -c \
+	"curl -sf --max-time 2 http://127.0.0.1:$STUB_PORT/v1/models >/dev/null"
+
+cat >"$CONFIG" <<EOF
+state_dir: "$STATE"
+service:
+  enabled: true
+backends:
+  - name: stub
+    type: openaicompatible
+    api_base: http://127.0.0.1:$STUB_PORT/v1
+    api_key: test
+    models:
+      - name: stub
+agents:
+  - name: chaz
+    model: stub
+    system_prompt: test fixture
+default_agents: [chaz]
+EOF
+
+# Concurrent cold clients must all converge on one daemon and one backend.
+declare -a pids=()
+for i in $(seq 1 8); do
+	"$CHAZ_BIN" --config "$CONFIG" usage --json >"$WORKSPACE/usage-$i.json" \
+		2>"$WORKSPACE/usage-$i.err" &
+	pids+=("$!")
+done
+for pid in "${pids[@]}"; do
+	wait "$pid" || fail "a concurrent usage client failed"
+done
+wait_for "service socket" 30 test -S "$STATE/eidetica.sock"
+[[ $(stat -c %a "$STATE/eidetica.sock") == 600 ]] || fail "service socket is not mode 0600"
+[[ $(stat -c %a "$STATE") == 700 ]] || fail "state directory is not mode 0700"
+DAEMON_PID="$(ss -xlpn | awk -v socket="$STATE/eidetica.sock" '
+	index($0, socket) && match($0, /pid=[0-9]+/) { pid = substr($0, RSTART + 4, RLENGTH - 4) }
+	END { print pid }
+')"
+[[ -n $DAEMON_PID ]] || fail "no daemon owns the service socket"
+[[ $(ps -o sid= -p "$DAEMON_PID" | tr -d ' ') == "$DAEMON_PID" ]] ||
+	fail "auto-started daemon did not detach into its own session"
+[[ $(pgrep -fc "^.*/${CHAZ_BIN##*/} --config $CONFIG daemon$") == 1 ]] ||
+	fail "concurrent clients started more than one daemon"
+
+# `--print` exercises the callback-driven frontend path against the daemon's
+# Instance. A subsequent command reads the same named session.
+PRINT_OUT="$("$CHAZ_BIN" --config "$CONFIG" --print --session print-shared hello \
+	2>"$WORKSPACE/print.err")" || fail "print frontend failed"
+[[ $PRINT_OUT == *"stub"* ]] || fail "print frontend returned an unexpected response"
+"$CHAZ_BIN" --config "$CONFIG" cmd '/info' --session print-shared \
+	>"$WORKSPACE/print-info.out" 2>"$WORKSPACE/print-info.err" ||
+	fail "command could not open the print session"
+grep -q 'Messages: 2' "$WORKSPACE/print-info.out" ||
+	fail "command did not see the print frontend's user and agent messages"
+
+# Client A writes; client B and usage both see the same daemon-hosted state.
+"$CHAZ_BIN" --config "$CONFIG" cmd '/name from-client-a' --session shared \
+	>"$WORKSPACE/client-a.out" 2>"$WORKSPACE/client-a.err" || fail "client A failed"
+"$CHAZ_BIN" --config "$CONFIG" cmd '/info' --session shared \
+	>"$WORKSPACE/client-b.out" 2>"$WORKSPACE/client-b.err" || fail "client B failed"
+grep -q 'Name: from-client-a' "$WORKSPACE/client-b.out" ||
+	fail "client B did not see client A's write"
+"$CHAZ_BIN" --config "$CONFIG" usage --json >"$WORKSPACE/final-usage.json" \
+	2>"$WORKSPACE/final-usage.err" || fail "usage client failed"
+jq -e '.per_session[] | select(.name == "from-client-a")' "$WORKSPACE/final-usage.json" \
+	>/dev/null || fail "usage did not see the command client's session"
+
+# Closest deterministic headless equivalent to daemon+TUI coexistence: the
+# TUI and cmd share exactly this bootstrap/build/session stack, while cmd avoids
+# requiring a pseudo-terminal.
+"$CHAZ_BIN" --config "$CONFIG" cmd '/sessions' >"$WORKSPACE/coexist.out" \
+	2>"$WORKSPACE/coexist.err" || fail "headless frontend coexistence client failed"
+[[ $(pgrep -fc "^.*/${CHAZ_BIN##*/} --config $CONFIG daemon$") == 1 ]] ||
+	fail "frontend coexistence changed daemon ownership"
+
+kill -TERM "$DAEMON_PID"
+wait_for "daemon shutdown" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
+DAEMON_PID=""
+[[ ! -e $STATE/eidetica.sock ]] || fail "clean shutdown left the service socket behind"
+
+printf 'PASS — 8 concurrent frontends converged on one detached daemon\n'
+printf 'PASS — --print completed a real callback-driven turn over the service\n'
+printf 'PASS — command and usage clients had bidirectional state visibility\n'
+printf 'PASS — headless frontend coexistence preserved sole daemon ownership\n'

@@ -1,8 +1,4 @@
 mod bridge;
-// The client half of service mode. The daemon holds the lifetime claim from
-// here; the auto-start machinery is built and tested ahead of the frontends
-// that will consume it, which is why parts of it are not called yet.
-#[allow(dead_code)]
 mod service_client;
 
 use chaz_core::bridge::Bridge;
@@ -58,9 +54,8 @@ enum Subcommand {
     /// sequence (`/pubkey`, `/agent invite`, `/agent share`, `/sharing
     /// approve`), which otherwise needs a human at a terminal.
     ///
-    /// Exits non-zero when the command reports an error. Run it with the
-    /// daemon stopped: it opens the same state directory, and two processes
-    /// on one backend do not observe each other's writes.
+    /// Exits non-zero when the command reports an error. Connects to the
+    /// daemon and starts it when needed.
     Cmd(CmdArgs),
 
     /// Run the agent peer with no user interface, until terminated.
@@ -71,9 +66,8 @@ enum Subcommand {
     /// systemd, a container, or a test harness, none of which can offer the
     /// TTY the TUI's raw mode requires.
     ///
-    /// With `service.enabled` in config, also serves this peer's eidetica
-    /// Instance on `<state_dir>/eidetica.sock` and refuses to start if another
-    /// daemon is already serving there.
+    /// Serves this peer's eidetica Instance on `<state_dir>/eidetica.sock` and
+    /// refuses to start if another daemon is already serving there.
     ///
     /// Logs to stdout. Stops cleanly on Ctrl-C or SIGTERM.
     Daemon,
@@ -140,24 +134,58 @@ fn resolve_state_dir(config: &Config) -> Option<PathBuf> {
         .or_else(|| dirs::state_dir().map(|d| d.join("chaz")))
 }
 
-/// Where the daemon serves its eidetica Instance, or `None` when the service
-/// socket is switched off.
+/// Where the daemon serves its eidetica Instance, or `None` when explicitly
+/// switched off.
 ///
 /// The default sits beside the database it fronts rather than at eidetica's
 /// per-user default path: one user runs several chaz peers — a daemon and one
 /// or more transport bridges — and each owns a separate backend, so a per-user
 /// singleton socket would front the wrong one.
 fn resolve_service_socket(config: &Config, state_dir: Option<&std::path::Path>) -> Option<PathBuf> {
-    let service = config.service.as_ref()?;
-    if !service.enabled {
+    if config
+        .service
+        .as_ref()
+        .is_some_and(|service| !service.enabled)
+    {
         return None;
     }
-    Some(match &service.path {
-        Some(path) => agent::expand_home(std::path::Path::new(path)),
-        None => state_dir
-            .map(|d| d.join("eidetica.sock"))
-            .unwrap_or_else(|| PathBuf::from("eidetica.sock")),
-    })
+    Some(
+        match config
+            .service
+            .as_ref()
+            .and_then(|service| service.path.as_ref())
+        {
+            Some(path) => agent::expand_home(std::path::Path::new(path)),
+            None => state_dir
+                .map(|d| d.join("eidetica.sock"))
+                .unwrap_or_else(|| PathBuf::from("eidetica.sock")),
+        },
+    )
+}
+
+/// The one local-client path to this peer's Eidetica backend.
+///
+/// Frontends never open SQLite. They start the daemon through the single-flight
+/// interlock when needed, then login over its owner-only service socket.
+async fn connect_frontend(
+    config: &Config,
+    config_path: &std::path::Path,
+    state_dir: Option<&std::path::Path>,
+) -> anyhow::Result<(eidetica::Instance, eidetica::user::User)> {
+    let state_dir = state_dir.ok_or_else(|| {
+        anyhow::anyhow!("could not determine a state directory for the eidetica service")
+    })?;
+    let socket = resolve_service_socket(config, Some(state_dir)).ok_or_else(|| {
+        anyhow::anyhow!(
+            "local frontends require `service.enabled: true`; direct backend access is not supported"
+        )
+    })?;
+    let spawn = service_client::SpawnChazDaemon::from_current_exe(config_path.to_path_buf())?;
+    let instance = service_client::AutoStart::new(socket, state_dir, spawn)
+        .connect()
+        .await?;
+    let user = instance.login_user("chaz", None).await?;
+    Ok((instance, user))
 }
 
 /// Take the claim that says "I am the daemon for this state directory", to be
@@ -223,22 +251,31 @@ fn service_socket_lock_path(path: &std::path::Path) -> PathBuf {
 fn claim_service_socket(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let lock_path = service_socket_lock_path(path);
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "could not create the parent directory {} of the service socket at {}",
-                parent.display(),
-                path.display()
-            )
-        })?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
-            || {
+        if parent.exists() {
+            let mode = std::fs::metadata(parent)?.permissions().mode() & 0o777;
+            if mode != 0o700 {
+                anyhow::bail!(
+                    "the existing service socket parent {} has mode {mode:04o}; refusing to change a possibly shared directory (use a dedicated mode-0700 directory)",
+                    parent.display()
+                );
+            }
+        } else {
+            std::fs::create_dir_all(parent).with_context(|| {
                 format!(
-                    "could not restrict the parent directory {} of the service socket at {} to owner-only access",
+                    "could not create the parent directory {} of the service socket at {}",
                     parent.display(),
                     path.display()
                 )
-            },
-        )?;
+            })?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| {
+                    format!(
+                        "could not restrict the parent directory {} of the service socket at {} to owner-only access",
+                        parent.display(),
+                        path.display()
+                    )
+                })?;
+        }
     }
     let file = std::fs::File::create(&lock_path).with_context(|| {
         format!(
@@ -264,13 +301,6 @@ fn claim_service_socket(path: &std::path::Path) -> anyhow::Result<std::fs::File>
 /// The socket is ready only once it accepts a connection *and* is mode 0600.
 /// `ServiceServer` binds before it chmods, so connect alone would let a
 /// server that fails its chmod pass as ready in the gap before it exits.
-fn socket_is_ready(path: &std::path::Path) -> bool {
-    let mode_0600 = std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o777 == 0o600)
-        .unwrap_or(false);
-    mode_0600 && service_client::socket_is_live(path)
-}
-
 /// Fail startup unless the spawned service server actually comes up on `path`.
 ///
 /// The server task races a bounded readiness probe under `tokio::select!`,
@@ -291,7 +321,7 @@ async fn await_service_readiness(
     let ready = async {
         let deadline = Instant::now() + timeout;
         loop {
-            if socket_is_ready(path) {
+            if service_client::socket_is_ready(path).await {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -360,10 +390,18 @@ async fn main() -> anyhow::Result<()> {
     let state_dir = resolve_state_dir(&config);
     if let Some(dir) = &state_dir {
         std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(
+            || {
+                format!(
+                    "could not restrict state directory {} to owner-only access",
+                    dir.display()
+                )
+            },
+        )?;
     }
 
-    // Subcommand routing. `usage` is a read-only utility: it opens the DB,
-    // does its work, and exits without a bridge, scheduler, MCP, or sync.
+    // Subcommand routing. `usage` is a read-only utility: it connects to the
+    // daemon, does its work, and exits without a bridge, scheduler, MCP, or sync.
     // `cmd` needs the fully-wired server, so it falls through and is dispatched
     // as a bridge below.
     let mut cmd_args: Option<CmdArgs> = None;
@@ -380,15 +418,17 @@ async fn main() -> anyhow::Result<()> {
                     .with_env_filter(filter)
                     .with_writer(std::io::stderr)
                     .init();
-                return run_usage_subcommand(usage_args, &config, state_dir.as_deref()).await;
+                return run_usage_subcommand(
+                    usage_args,
+                    &config,
+                    &config_path,
+                    state_dir.as_deref(),
+                )
+                .await;
             }
             Subcommand::Cmd(a) => cmd_args = Some(a),
         }
     }
-
-    // Both one-shot modes reserve stdout for their result, so neither can log
-    // to it.
-    let headless_oneshot = args.print || cmd_args.is_some();
 
     // Init tracing. Honour RUST_LOG; default to info when unset.
     //
@@ -449,9 +489,8 @@ async fn main() -> anyhow::Result<()> {
     // Whole-startup wall clock: time from here to the gateway taking over.
     let startup_start = Instant::now();
 
-    // The eidetica service socket, when the daemon is asked to serve one.
-    // Only the daemon serves: every other mode is a frontend, and step one of
-    // the migration gives them nothing to connect to yet.
+    // The daemon opens and serves SQLite. Every other local mode connects to
+    // that service, auto-starting the daemon when needed.
     let service_socket = if daemon_mode {
         resolve_service_socket(&config, state_dir.as_deref())
     } else {
@@ -478,7 +517,7 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
     if let Some(socket) = &service_socket
-        && service_client::socket_is_live(socket)
+        && service_client::socket_is_ready(socket).await
     {
         anyhow::bail!(
             "something is already serving {} — refusing to start a second \
@@ -487,21 +526,26 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Initialize eidetica with SQLite backend for persistent storage
-    let eidetica_db_path = state_dir
-        .as_ref()
-        .map(|d| d.join("eidetica.db"))
-        .unwrap_or_else(|| PathBuf::from("eidetica.db"));
     let t = Instant::now();
-    let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
-    let (instance, maybe_user) = eidetica::Instance::connect_or_create_backend(
-        Box::new(backend),
-        eidetica::NewUser::passwordless("chaz"),
-    )
-    .await?;
-    let user = match maybe_user {
-        Some(u) => u,
-        None => instance.login_user("chaz", None).await?,
+    let (instance, user) = if daemon_mode {
+        let eidetica_db_path = state_dir
+            .as_ref()
+            .map(|d| d.join("eidetica.db"))
+            .unwrap_or_else(|| PathBuf::from("eidetica.db"));
+        let backend =
+            eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
+        let (instance, maybe_user) = eidetica::Instance::connect_or_create_backend(
+            Box::new(backend),
+            eidetica::NewUser::passwordless("chaz"),
+        )
+        .await?;
+        let user = match maybe_user {
+            Some(u) => u,
+            None => instance.login_user("chaz", None).await?,
+        };
+        (instance, user)
+    } else {
+        connect_frontend(&config, &config_path, state_dir.as_deref()).await?
     };
     info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
@@ -511,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
     // Clone before `server::build` takes ownership. The service server serves
     // the very Instance the daemon runs on — that is what makes a connected
     // client see the daemon's writes instead of racing them.
-    let service_instance = service_socket.as_ref().map(|_| instance.clone());
+    let service_instance = (daemon_mode && service_socket.is_some()).then(|| instance.clone());
 
     // In non-interactive --print mode there is no approval UI; pass the
     // configured (or default) CLI auto-approved tools so shell/write_file work
@@ -542,16 +586,16 @@ async fn main() -> anyhow::Result<()> {
         user,
         server::BuildOptions {
             config_path: config_path.clone(),
-            // Command mode needs sync even though it is one-shot: `/agent
-            // share` mints a ticket out of the sync layer and refuses outright
-            // without it, and minting tickets is most of the point.
-            enable_sync: cmd_args.is_some() || !args.print,
-            run_routine_engine: !headless_oneshot,
-            // The chaz daemon owns its agents — mint their DBs from config.
-            bootstrap_agents_from_config: true,
-            // Command mode administers the peer; it never runs a turn, and
-            // starting the loop would risk billing one as a side effect.
-            run_agent_loop: cmd_args.is_none(),
+            // The daemon owns sync and all long-lived work. A connected
+            // Instance must not start a second client-side copy.
+            enable_sync: daemon_mode,
+            run_routine_engine: daemon_mode,
+            // The daemon is the sole owner that may mint peer-owned DBs.
+            bootstrap_agents_from_config: daemon_mode,
+            // TUI/print retain their local runtime over the connected
+            // Instance; cmd never runs a billable turn. The daemon handles
+            // its own registered sessions (including transport bridges).
+            run_agent_loop: daemon_mode || cmd_args.is_none(),
             extra_auto_approved_tools,
             // `--print` runs exactly one turn, so its tool list has to be
             // complete before that turn starts. Long-lived modes take the
@@ -686,13 +730,14 @@ async fn wait_for_shutdown() {
     }
 }
 
-/// `chaz usage` — open the eidetica DB read-only, walk the user-central
+/// `chaz usage` — connect to the eidetica service, walk the user-central
 /// session catalog, aggregate per-message `ResponseMetadata`, print either
 /// human-readable text or JSON, then exit. Skips all bridge/sync/scheduler
 /// setup since we never serve a session here.
 async fn run_usage_subcommand(
     args: UsageArgs,
     config: &Config,
+    config_path: &std::path::Path,
     state_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let bridge_filter = match args.bridge.as_deref() {
@@ -704,19 +749,7 @@ async fn run_usage_subcommand(
         None => None,
     };
 
-    let eidetica_db_path = state_dir
-        .map(|d| d.join("eidetica.db"))
-        .unwrap_or_else(|| PathBuf::from("eidetica.db"));
-    let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
-    let (instance, maybe_user) = eidetica::Instance::connect_or_create_backend(
-        Box::new(backend),
-        eidetica::NewUser::passwordless("chaz"),
-    )
-    .await?;
-    let user = match maybe_user {
-        Some(u) => u,
-        None => instance.login_user("chaz", None).await?,
-    };
+    let (instance, user) = connect_frontend(config, config_path, state_dir).await?;
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(config));
     if agent_registry.is_empty() {
@@ -803,15 +836,14 @@ mod tests {
     }
 
     #[test]
-    fn service_socket_is_off_unless_asked_for() {
+    fn service_socket_is_on_by_default_and_can_be_disabled() {
         let state = PathBuf::from("/var/lib/chaz");
 
-        // No block at all, and an explicitly disabled block, both mean off —
-        // including one that names a path, which is a path to nowhere until
-        // someone flips `enabled`.
+        // Local frontends are clients by default, so the daemon serves beside
+        // the backend unless an operator explicitly disables service mode.
         assert_eq!(
             resolve_service_socket(&Config::default(), Some(&state)),
-            None
+            Some(state.join("eidetica.sock"))
         );
         let config = Config {
             service: Some(ServiceConfig {
@@ -887,7 +919,10 @@ mod tests {
         let state_b = tmp.path().join("state-b");
         std::fs::create_dir_all(&state_a).unwrap();
         std::fs::create_dir_all(&state_b).unwrap();
-        let socket = tmp.path().join("shared.sock");
+        let socket_parent = tmp.path().join("shared-socket");
+        std::fs::create_dir(&socket_parent).unwrap();
+        std::fs::set_permissions(&socket_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = socket_parent.join("eidetica.sock");
 
         // Different state directories: the state-dir claim is per-directory,
         // so both daemons hold theirs at once — it cannot be what serializes
@@ -971,7 +1006,24 @@ mod tests {
     }
 
     #[test]
-    fn socket_is_ready_requires_0600_even_while_live() {
+    fn taking_the_claim_refuses_to_chmod_an_existing_shared_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = claim_service_socket(&shared.join("eidetica.sock"))
+            .expect_err("an existing shared parent must fail closed");
+        assert!(format!("{err}").contains("refusing to change"), "{err}");
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "failure must leave the existing directory untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_is_ready_requires_0600_even_while_live() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("eidetica.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -980,13 +1032,13 @@ mod tests {
         // half of readiness is missing, so it must not count as ready.
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            !super::socket_is_ready(&socket),
+            !super::service_client::socket_is_ready(&socket).await,
             "a live socket with mode 0755 must not be ready"
         );
 
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(
-            super::socket_is_ready(&socket),
+            super::service_client::socket_is_ready(&socket).await,
             "a live socket with mode 0600 must be ready"
         );
     }
@@ -1049,7 +1101,7 @@ mod tests {
             .await
             .expect("a bindable socket must come up");
         assert!(
-            super::socket_is_ready(&socket),
+            super::service_client::socket_is_ready(&socket).await,
             "socket must be live and 0600"
         );
 

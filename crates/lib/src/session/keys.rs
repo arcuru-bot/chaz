@@ -479,6 +479,22 @@ impl SessionRegistry {
     /// produce a ticket the holder can paste into the corresponding import
     /// command on another peer.
     pub async fn share_for(&self, db_id: &eidetica::entry::ID) -> anyhow::Result<DatabaseTicket> {
+        if self.instance.remote_connection().is_some() {
+            let addresses = self.service_sync_addresses().await?;
+            if addresses.is_empty() {
+                anyhow::bail!("daemon has no published sync transport addresses");
+            }
+            self.enable_sync_for(db_id).await?;
+            return Ok(DatabaseTicket::with_addresses(
+                db_id.clone(),
+                addresses
+                    .into_iter()
+                    .map(|(transport, address)| {
+                        eidetica::sync::peer_types::Address::new(transport, address)
+                    })
+                    .collect(),
+            ));
+        }
         let mut user = self.user.lock().await;
         let ticket = user.share(db_id).await?;
         info!(db_id = %db_id, "Shared DB (sync enabled, ticket built)");

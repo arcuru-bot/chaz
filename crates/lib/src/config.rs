@@ -69,7 +69,7 @@ pub struct Config {
     pub cli: Option<CliConfig>,
     /// Eidetica service socket the daemon serves its own backend on, so that
     /// other local chaz processes can reach it as clients instead of opening
-    /// the same database file. Omit to leave it off.
+    /// the same database file. Omit to use the default socket.
     pub service: Option<ServiceConfig>,
     /// Per-extension agent allowlists for the `AgentStateAdmin` cap.
     /// Each entry maps an extension name (e.g. `"schedule"`) to the
@@ -234,9 +234,9 @@ pub struct CliConfig {
 /// answers that with service mode — one process owns the backend and serves it
 /// over a Unix socket, and everything else connects as a client.
 ///
-/// With `enabled: true` the daemon additionally serves its Instance on
-/// `<state_dir>/eidetica.sock`. Nothing connects to it yet, so this is
-/// inert until the local frontends are migrated; it is off by default.
+/// The daemon serves its Instance on `<state_dir>/eidetica.sock` by default.
+/// `enabled: false` is an explicit daemon-only escape hatch; local frontends
+/// then fail rather than opening the backend directly.
 ///
 /// The socket is deliberately per-state-directory rather than eidetica's own
 /// per-user default (`$XDG_RUNTIME_DIR/eidetica/service.sock`): one user runs
@@ -248,15 +248,27 @@ pub struct CliConfig {
 ///   enabled: true
 ///   path: /run/user/1000/chaz-eidetica.sock
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
-    /// Serve the socket in daemon mode. Defaults to false, which reproduces
-    /// the embedded-only behaviour exactly.
-    #[serde(default)]
+    /// Serve the socket in daemon mode. Defaults to true.
+    #[serde(default = "default_service_enabled")]
     pub enabled: bool,
     /// Override the socket path. Defaults to `<state_dir>/eidetica.sock`.
     /// A leading `~` is expanded.
     pub path: Option<String>,
+}
+
+const fn default_service_enabled() -> bool {
+    true
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+        }
+    }
 }
 
 pub fn default_cli_auto_approved() -> Vec<String> {
@@ -1629,7 +1641,7 @@ context:
     }
 
     #[test]
-    fn service_block_parses_and_defaults_to_off() {
+    fn service_block_parses_and_defaults_to_on() {
         let yaml = "service:\n  enabled: true\n  path: /run/user/1000/chaz.sock\n";
         assert!(
             check_unknown_config_keys(yaml).is_empty(),
@@ -1640,11 +1652,10 @@ context:
         assert!(service.enabled);
         assert_eq!(service.path.as_deref(), Some("/run/user/1000/chaz.sock"));
 
-        // A bare `service:` block opts in to nothing: the socket stays off
-        // unless the operator says otherwise.
+        // A bare block keeps the client/daemon topology enabled.
         let bare: Config = serde_yaml::from_str("service: {}\n").expect("bare service parses");
         let bare = bare.service.expect("service block present");
-        assert!(!bare.enabled);
+        assert!(bare.enabled);
         assert!(bare.path.is_none());
     }
 

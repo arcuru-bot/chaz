@@ -330,6 +330,8 @@ BRIDGE_CONFIG="$WORKSPACE/bridge.yaml"
 cat >"$DAEMON_CONFIG" <<EOF
 state_dir: "$WORKSPACE/state-daemon"
 $SYNC_LISTEN_DAEMON
+service:
+  enabled: true
 
 backends:
   - name: stub
@@ -430,10 +432,18 @@ agents:
 EOF
 
 # ------------------------------------------------------------- processes -----
-log "starting daemon"
-spawn daemon "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
-DAEMON_PID="$SPAWNED_PID"
-wait_for "daemon" 90 grep -q "daemon ready" "$WORKSPACE/daemon.log"
+# `chaz cmd` above started the daemon through the same service-client path the
+# local frontends use in production. Assert that routing happened rather than
+# silently starting another direct opener, then adopt that process into the
+# harness cleanup/restart bookkeeping.
+wait_for "daemon service socket" 90 test -S "$WORKSPACE/state-daemon/eidetica.sock"
+DAEMON_PID="$(ss -xlpn | awk -v socket="$WORKSPACE/state-daemon/eidetica.sock" '
+	index($0, socket) && match($0, /pid=[0-9]+/) { pid = substr($0, RSTART + 4, RLENGTH - 4) }
+	END { print pid }
+')"
+[[ -n $DAEMON_PID ]] || fail "service-mode bring-up left no daemon owning the socket"
+PIDS+=("$DAEMON_PID")
+printf 'auto-started daemon pid=%s; service socket ready\n' "$DAEMON_PID" >"$WORKSPACE/daemon.log"
 
 # The bridge's own crate runs at debug so its message-routing decisions are
 # visible; everything else stays at info. A case about a message that must be

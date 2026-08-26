@@ -773,6 +773,7 @@ dependencies = [
  "dirs",
  "eidetica",
  "insta",
+ "libc",
  "matrix-sdk",
  "nucleo-matcher",
  "ratatui",

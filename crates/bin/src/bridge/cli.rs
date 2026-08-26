@@ -91,7 +91,9 @@ impl Bridge for CliBridge {
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
 
-        // Approval channel = None → auto-deny any tool needing approval.
+        // The frontend runs this one local session against the daemon-hosted
+        // Instance; it does not own sync or the embedded backend. Approval
+        // channel = None → auto-deny any tool needing approval.
         server
             .register_session(&session_db, backend, None, None)
             .await?;

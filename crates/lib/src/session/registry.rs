@@ -75,8 +75,34 @@ pub(super) const STORE_SESSION_CATALOG: &str = "session_catalog";
 /// `chaz_peer` (per-machine), not the cross-peer `chaz_group`.
 const STORE_PEER_DEFAULTS: &str = "peer_defaults";
 const KEY_DEFAULT_AGENTS: &str = "default_agents";
+const STORE_SERVICE_STATE: &str = "service_state";
+const KEY_SYNC_ADDRESSES: &str = "sync_addresses";
 
 impl SessionRegistry {
+    pub async fn publish_sync_addresses(
+        &self,
+        addresses: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let tx = self.chaz_peer.new_transaction().await?;
+        let store = tx.get_store::<DocStore>(STORE_SERVICE_STATE).await?;
+        store
+            .set_string(KEY_SYNC_ADDRESSES, serde_json::to_string(addresses)?)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn service_sync_addresses(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let store = self
+            .chaz_peer
+            .get_store_viewer::<DocStore>(STORE_SERVICE_STATE)
+            .await?;
+        match store.get_string(KEY_SYNC_ADDRESSES).await {
+            Ok(raw) => Ok(serde_json::from_str(&raw)?),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
     pub async fn new(
         instance: eidetica::Instance,
         mut user: eidetica::user::User,

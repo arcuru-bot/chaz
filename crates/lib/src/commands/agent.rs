@@ -385,11 +385,6 @@ pub(super) async fn agent_share(agent_ref: &str, ctx: &CommandContext<'_>) -> Co
         Err(msg) => return CommandOutcome::Error(msg),
     };
 
-    let instance = ctx.server.registry().instance();
-    if instance.sync().is_none() {
-        return CommandOutcome::Error("Sync not enabled".to_string());
-    }
-
     let ticket = match ctx.server.registry().share_for(&entry.db_id).await {
         Ok(t) => t,
         Err(e) => return CommandOutcome::Error(format!("Failed to share agent DB: {e}")),

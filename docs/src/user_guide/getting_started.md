@@ -138,9 +138,8 @@ chaz --config config.yaml cmd '/sharing requests'
 ```
 
 The result goes to stdout, and a command that reports an error exits non-zero,
-so scripts can branch on it. Run it with the daemon stopped — it opens the same
-state directory, and two processes on one backend do not observe each other's
-writes.
+so scripts can branch on it. The command connects to the local daemon and
+starts it automatically when needed.
 
 ## Single-shot print mode
 

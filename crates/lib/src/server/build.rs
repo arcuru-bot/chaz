@@ -116,6 +116,7 @@ pub async fn build(
     // Enable eidetica sync for session sharing. Register iroh P2P transport
     // by default (stable peer identity, no address config needed). If
     // sync_listen is configured, also bind HTTP for traditional access.
+    let mut sync_addresses = Vec::new();
     if opts.enable_sync {
         instance.enable_sync().await?;
         if let Some(sync) = instance.sync() {
@@ -159,6 +160,25 @@ pub async fn build(
             } else {
                 info!("Sync already accepting connections; keeping the existing address");
             }
+            sync_addresses = sync.get_all_server_addresses().await?;
+
+            // Remote frontends can update the user's tracked-DB settings over
+            // the service, but a connected Instance deliberately owns no Sync
+            // handle. Recompute the daemon's combined sync state whenever the
+            // authoritative preferences DB changes so `/agent share` and
+            // friends retain their transport-neutral command semantics.
+            let sync_for_prefs = sync.clone();
+            let user_uuid = user.user_uuid().to_string();
+            let preferences_id = user.user_database().root_id().clone();
+            user.user_database()
+                .on_write(move |_event, _db| {
+                    let sync = sync_for_prefs.clone();
+                    let user_uuid = user_uuid.clone();
+                    let preferences_id = preferences_id.clone();
+                    Box::pin(async move { sync.sync_user(&user_uuid, &preferences_id).await })
+                })
+                .await?
+                .detach();
         }
     }
 
@@ -201,6 +221,9 @@ pub async fn build(
 
     let t = Instant::now();
     let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
+    if !sync_addresses.is_empty() {
+        registry.publish_sync_addresses(&sync_addresses).await?;
+    }
     info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
         "Session registry initialized"
@@ -215,6 +238,24 @@ pub async fn build(
         let user = registry.user_lock().await;
         hosted_index::build_from_user(&user).await?
     };
+
+    // A connected client must prove each hosted entity's per-DB key to the
+    // service connection before the ordinary index walk can read that tree.
+    // The bootstrap path above already has the exact DB/pubkey pairs, so seed
+    // the client-side index from them rather than weakening Eidetica's gate or
+    // changing entity identity to the login key.
+    if registry.instance().remote_connection().is_some() {
+        let user = registry.user_lock().await;
+        for name in agent_registry.names() {
+            if let Some((db, pubkey)) = agent_db::find_agent_db(&user, &name).await {
+                agent_index_store.register(hosted_index::DbEntry {
+                    db_id: db.id(),
+                    display_name: name,
+                    pubkey,
+                });
+            }
+        }
+    }
 
     // Surface pre-existing co-owned agents/sessions whose `home_pubkey` is
     // still unset (legacy default). These keep working as before — any
@@ -522,6 +563,11 @@ pub async fn build(
         mcp_registry.clone(),
         opts.run_agent_loop,
     );
+    server.set_runtime_mode(config.runtime.unwrap_or(if opts.run_agent_loop {
+        config::RuntimeMode::Auto
+    } else {
+        config::RuntimeMode::Never
+    }));
     assert!(
         spawn_server_cell.set(server.clone()).is_ok(),
         "Spawn tool server cell already set"
