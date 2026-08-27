@@ -101,6 +101,7 @@ pub struct MemoryExtension {
     registry: Arc<SessionRegistry>,
     agent_index: HostedIndex,
     memory_bank_index: HostedIndex,
+    skill_bank_index: HostedIndex,
     embedder: Option<Arc<dyn Embedder>>,
 }
 
@@ -109,12 +110,14 @@ impl MemoryExtension {
         registry: Arc<SessionRegistry>,
         agent_index: HostedIndex,
         memory_bank_index: HostedIndex,
+        skill_bank_index: HostedIndex,
         embedder: Option<Arc<dyn Embedder>>,
     ) -> Self {
         Self {
             registry,
             agent_index,
             memory_bank_index,
+            skill_bank_index,
             embedder,
         }
     }
@@ -171,6 +174,7 @@ impl Extension for MemoryExtension {
         let registry = self.registry.clone();
         let agent_index = self.agent_index.clone();
         let memory_bank_index = self.memory_bank_index.clone();
+        let skill_bank_index = self.skill_bank_index.clone();
         let embedder = self.embedder.clone();
         let manifest = self.manifest();
         Box::pin(async move {
@@ -180,6 +184,7 @@ impl Extension for MemoryExtension {
                     registry,
                     agent_index,
                     memory_bank_index,
+                    skill_bank_index,
                     embedder,
                 })
                     as Arc<dyn crate::extension::ExtensionInstance>),
@@ -227,6 +232,7 @@ struct MemoryGlobalInstance {
     registry: Arc<SessionRegistry>,
     agent_index: HostedIndex,
     memory_bank_index: HostedIndex,
+    skill_bank_index: HostedIndex,
     embedder: Option<Arc<dyn Embedder>>,
 }
 
@@ -261,6 +267,7 @@ impl crate::extension::ExtensionInstance for MemoryGlobalInstance {
                 registry: self.registry.clone(),
                 agent_index: self.agent_index.clone(),
                 memory_bank_index: self.memory_bank_index.clone(),
+                skill_bank_index: self.skill_bank_index.clone(),
             }),
         )]
     }
@@ -560,6 +567,7 @@ struct MemoryCommand {
     registry: Arc<SessionRegistry>,
     agent_index: HostedIndex,
     memory_bank_index: HostedIndex,
+    skill_bank_index: HostedIndex,
 }
 
 impl ExtensionCommand for MemoryCommand {
@@ -713,6 +721,20 @@ impl MemoryCommand {
                 pubkey,
             });
 
+        if let Err(e) = self
+            .registry
+            .publish_hosted_indices(
+                &self.agent_index,
+                &self.memory_bank_index,
+                &self.skill_bank_index,
+            )
+            .await
+        {
+            return ExtensionCommandOutcome::Error(format!(
+                "Created memory bank '{name}' but failed to publish the service catalog: {e}"
+            ));
+        }
+
         ExtensionCommandOutcome::Text(format!(
             "Created memory bank '{name}' (DB {}). Grant it to an agent with /memory grant.",
             bank.id()
@@ -729,6 +751,21 @@ impl MemoryCommand {
         };
 
         self.memory_bank_index.unregister(&entry.db_id);
+
+        if let Err(e) = self
+            .registry
+            .publish_hosted_indices(
+                &self.agent_index,
+                &self.memory_bank_index,
+                &self.skill_bank_index,
+            )
+            .await
+        {
+            return ExtensionCommandOutcome::Error(format!(
+                "Deleted memory bank '{}' but failed to publish the service catalog: {e}",
+                entry.display_name
+            ));
+        }
 
         ExtensionCommandOutcome::Text(format!(
             "Deleted memory bank '{}' (DB {} preserved for archive). Agents with this bank in \
@@ -1034,6 +1071,15 @@ impl MemoryCommand {
                  sync: {e}"
             ));
         }
+
+        self.registry
+            .publish_hosted_indices(
+                &self.agent_index,
+                &self.memory_bank_index,
+                &self.skill_bank_index,
+            )
+            .await
+            .map_err(|e| format!("Imported memory bank '{display_name}' but failed to publish the service catalog: {e}"))?;
 
         Ok(ImportOutcome::Imported {
             display_name,
@@ -1442,10 +1488,12 @@ mod tests {
         );
         let agent_index = HostedIndex::empty("agent");
         let memory_bank_index = HostedIndex::empty("bank");
+        let skill_bank_index = HostedIndex::empty("skill_bank");
         let cmd = MemoryCommand {
             registry: registry.clone(),
             agent_index,
             memory_bank_index,
+            skill_bank_index,
         };
         (instance, registry, cmd)
     }

@@ -138,6 +138,23 @@ impl SessionRegistry {
         Ok(())
     }
 
+    /// Publish the current hosted-entity indices for service clients to hydrate.
+    ///
+    /// The indices remain the runtime source for lifecycle commands; this only
+    /// refreshes the daemon-owned service snapshot after one changes.
+    pub async fn publish_hosted_indices(
+        &self,
+        agents: &crate::hosted_index::HostedIndex,
+        memory_banks: &crate::hosted_index::HostedIndex,
+        skill_banks: &crate::hosted_index::HostedIndex,
+    ) -> anyhow::Result<()> {
+        let agents = agents.list();
+        let memory_banks = memory_banks.list();
+        let skill_banks = skill_banks.list();
+        self.publish_hosted_entities(&agents, &memory_banks, &skill_banks)
+            .await
+    }
+
     pub async fn service_hosted_entities(
         &self,
     ) -> anyhow::Result<(

@@ -131,7 +131,7 @@ jq -e '.per_session[] | select(.name == "from-client-a")' "$WORKSPACE/final-usag
 # yields nothing; the daemon's published peer-local index is the only way these
 # reach a frontend. Memory banks are the load-bearing case — without the index
 # the memory extension resolves no bank and every memory tool fails.
-"$CHAZ_BIN" --config "$CONFIG" cmd '/agents' >"$WORKSPACE/hosted-agents.out" \
+"$CHAZ_BIN" --config "$CONFIG" cmd '/agent hosted' >"$WORKSPACE/hosted-agents.out" \
 	2>"$WORKSPACE/hosted-agents.err" || fail "hosted agent index client failed"
 grep -q 'chaz' "$WORKSPACE/hosted-agents.out" ||
 	fail "client did not see the daemon's hosted agent index"
@@ -143,7 +143,7 @@ grep -q 'shared-notes' "$WORKSPACE/hosted-banks.out" ||
 
 # A client's build must not overwrite the daemon's published catalog with its
 # own empty pre-hydration view. A later independent client must still see both.
-"$CHAZ_BIN" --config "$CONFIG" cmd '/agents' --session print-shared \
+"$CHAZ_BIN" --config "$CONFIG" cmd '/agent hosted' --session print-shared \
 	>"$WORKSPACE/hosted-agents-again.out" 2>"$WORKSPACE/hosted-agents-again.err" ||
 	fail "later hosted agent index client failed"
 grep -q 'chaz' "$WORKSPACE/hosted-agents-again.out" ||
@@ -153,6 +153,26 @@ grep -q 'chaz' "$WORKSPACE/hosted-agents-again.out" ||
 	fail "later hosted memory bank index client failed"
 grep -q 'shared-notes' "$WORKSPACE/hosted-banks-again.out" ||
 	fail "a client overwrote the daemon's hosted memory bank index"
+
+# Lifecycle mutations happen in a frontend process, so publishing only during
+# daemon startup would leave the next fresh client with the old catalog.
+"$CHAZ_BIN" --config "$CONFIG" cmd '/agent new frontend-mutant' \
+	>"$WORKSPACE/catalog-create.out" 2>"$WORKSPACE/catalog-create.err" ||
+	fail "client could not create a hosted agent"
+"$CHAZ_BIN" --config "$CONFIG" cmd '/agent hosted' \
+	>"$WORKSPACE/catalog-after-create.out" 2>"$WORKSPACE/catalog-after-create.err" ||
+	fail "fresh client could not read the published created agent"
+grep -q 'frontend-mutant' "$WORKSPACE/catalog-after-create.out" ||
+	fail "fresh client did not see the newly published hosted agent"
+"$CHAZ_BIN" --config "$CONFIG" cmd '/agent delete frontend-mutant' \
+	>"$WORKSPACE/catalog-delete.out" 2>"$WORKSPACE/catalog-delete.err" ||
+	fail "client could not delete the hosted agent"
+"$CHAZ_BIN" --config "$CONFIG" cmd '/agent hosted' \
+	>"$WORKSPACE/catalog-after-delete.out" 2>"$WORKSPACE/catalog-after-delete.err" ||
+	fail "fresh client could not read the published deleted agent catalog"
+if grep -q 'frontend-mutant' "$WORKSPACE/catalog-after-delete.out"; then
+	fail "fresh client still saw a deleted hosted agent"
+fi
 
 # Closest deterministic headless equivalent to daemon+TUI coexistence: the
 # TUI and cmd share exactly this bootstrap/build/session stack, while cmd avoids
@@ -193,5 +213,6 @@ printf 'PASS — 8 concurrent frontends converged on one detached daemon\n'
 printf 'PASS — --print completed a real callback-driven turn over the service\n'
 printf 'PASS — command and usage clients had bidirectional state visibility\n'
 printf 'PASS — clients read the hosted agent and memory bank indices over the service\n'
+printf 'PASS — fresh clients converge after hosted agent creation and deletion\n'
 printf 'PASS — headless frontend coexistence preserved sole daemon ownership\n'
 printf 'PASS — service-disabled daemons still exclude a second backend opener\n'
