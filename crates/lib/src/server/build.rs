@@ -234,26 +234,33 @@ pub async fn build(
     // walking eidetica's tracked-DBs list. Each entry's `meta.kind` marker
     // classifies it. `/agent new`, `/memory new`, `/agent delete`, etc.
     // mutate these caches at runtime.
-    let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = {
+    let remote_client = registry.instance().remote_connection().is_some();
+    let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = if remote_client {
+        (
+            hosted_index::HostedIndex::empty("agent"),
+            hosted_index::HostedIndex::empty("memory_bank"),
+            hosted_index::HostedIndex::empty("skill_bank"),
+        )
+    } else {
         let user = registry.user_lock().await;
         hosted_index::build_from_user(&user).await?
     };
 
-    // A connected client must prove each hosted entity's per-DB key to the
-    // service connection before the ordinary index walk can read that tree.
-    // The bootstrap path above already has the exact DB/pubkey pairs, so seed
-    // the client-side index from them rather than weakening Eidetica's gate or
-    // changing entity identity to the login key.
-    if registry.instance().remote_connection().is_some() {
-        let user = registry.user_lock().await;
-        for name in agent_registry.names() {
-            if let Some((db, pubkey)) = agent_db::find_agent_db(&user, &name).await {
-                agent_index_store.register(hosted_index::DbEntry {
-                    db_id: db.id(),
-                    display_name: name,
-                    pubkey,
-                });
-            }
+    // A connected client must prove each hosted entity's per-DB key before it
+    // can read that tree, so its generic catalog walk cannot classify entities
+    // up front. The daemon publishes this peer-local index inside chaz_peer;
+    // clients read it through the authenticated service connection without
+    // changing entity keys or weakening per-tree authorization.
+    if remote_client {
+        let (agents, memory_banks, skill_banks) = registry.service_hosted_entities().await?;
+        for entry in agents {
+            agent_index_store.register(entry);
+        }
+        for entry in memory_banks {
+            memory_bank_index_store.register(entry);
+        }
+        for entry in skill_banks {
+            skill_bank_index_store.register(entry);
         }
     }
 
@@ -342,6 +349,20 @@ pub async fn build(
             }
         }
     }
+
+    // Bootstrap may auto-create default banks after the initial index walk,
+    // so the daemon publishes the final catalog only after that pass. Clients
+    // never publish: their index was hydrated from this catalog, not derived.
+    if !remote_client {
+        registry
+            .publish_hosted_entities(
+                &agent_index_store.list(),
+                &memory_bank_index_store.list(),
+                &skill_bank_index_store.list(),
+            )
+            .await?;
+    }
+
     // Build secret store backed by the chaz_peer DB.
     let secret_store = security::SecretStore::new(chaz_peer.clone()).await;
     if let Some(backends) = &mut config.backends {

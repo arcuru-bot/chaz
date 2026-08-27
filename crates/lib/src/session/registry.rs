@@ -77,6 +77,20 @@ const STORE_PEER_DEFAULTS: &str = "peer_defaults";
 const KEY_DEFAULT_AGENTS: &str = "default_agents";
 const STORE_SERVICE_STATE: &str = "service_state";
 const KEY_SYNC_ADDRESSES: &str = "sync_addresses";
+const KEY_HOSTED_AGENTS: &str = "hosted_agents";
+const KEY_HOSTED_MEMORY_BANKS: &str = "hosted_memory_banks";
+const KEY_HOSTED_SKILL_BANKS: &str = "hosted_skill_banks";
+
+async fn read_hosted_entries(
+    store: &DocStore,
+    key: &str,
+) -> anyhow::Result<Vec<crate::hosted_index::DbEntry>> {
+    match store.get_string(key).await {
+        Ok(raw) => Ok(serde_json::from_str(&raw)?),
+        Err(e) if e.is_not_found() => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
 
 impl SessionRegistry {
     pub async fn publish_sync_addresses(
@@ -101,6 +115,45 @@ impl SessionRegistry {
             Ok(raw) => Ok(serde_json::from_str(&raw)?),
             Err(_) => Ok(Vec::new()),
         }
+    }
+
+    pub async fn publish_hosted_entities(
+        &self,
+        agents: &[crate::hosted_index::DbEntry],
+        memory_banks: &[crate::hosted_index::DbEntry],
+        skill_banks: &[crate::hosted_index::DbEntry],
+    ) -> anyhow::Result<()> {
+        let tx = self.chaz_peer.new_transaction().await?;
+        let store = tx.get_store::<DocStore>(STORE_SERVICE_STATE).await?;
+        for (key, entries) in [
+            (KEY_HOSTED_AGENTS, agents),
+            (KEY_HOSTED_MEMORY_BANKS, memory_banks),
+            (KEY_HOSTED_SKILL_BANKS, skill_banks),
+        ] {
+            store
+                .set_string(key, serde_json::to_string(entries)?)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn service_hosted_entities(
+        &self,
+    ) -> anyhow::Result<(
+        Vec<crate::hosted_index::DbEntry>,
+        Vec<crate::hosted_index::DbEntry>,
+        Vec<crate::hosted_index::DbEntry>,
+    )> {
+        let store = self
+            .chaz_peer
+            .get_store_viewer::<DocStore>(STORE_SERVICE_STATE)
+            .await?;
+        Ok((
+            read_hosted_entries(&store, KEY_HOSTED_AGENTS).await?,
+            read_hosted_entries(&store, KEY_HOSTED_MEMORY_BANKS).await?,
+            read_hosted_entries(&store, KEY_HOSTED_SKILL_BANKS).await?,
+        ))
     }
 
     pub async fn new(
@@ -635,6 +688,42 @@ mod tests {
             Some(eidetica::crdt::doc::Value::Doc(d)) => DelegatedTreeRef::try_from(d).ok(),
             _ => None,
         }
+    }
+
+    #[tokio::test]
+    async fn hosted_entities_round_trip_through_peer_service_state() {
+        let (_instance, registry) = make_registry().await;
+        let agent = crate::hosted_index::DbEntry {
+            db_id: registry.chaz_group().root_id().clone(),
+            display_name: "chaz".into(),
+            pubkey: registry
+                .find_key_for_db(registry.chaz_group().root_id())
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        let memory = crate::hosted_index::DbEntry {
+            display_name: "shared-notes".into(),
+            ..agent.clone()
+        };
+        let skill = crate::hosted_index::DbEntry {
+            display_name: "shared-skills".into(),
+            ..agent.clone()
+        };
+
+        registry
+            .publish_hosted_entities(
+                std::slice::from_ref(&agent),
+                std::slice::from_ref(&memory),
+                std::slice::from_ref(&skill),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registry.service_hosted_entities().await.unwrap(),
+            (vec![agent], vec![memory], vec![skill])
+        );
     }
 
     #[tokio::test]

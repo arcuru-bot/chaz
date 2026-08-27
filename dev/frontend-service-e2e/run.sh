@@ -5,6 +5,7 @@ CHAZ_BIN="${CHAZ_BIN:-target/debug/chaz}"
 STUB_LLM="${STUB_LLM:-dev/matrix-e2e/stub_llm.py}"
 WORKSPACE="$(mktemp -d -t chaz-frontend-service-e2e-XXXXXX)"
 STATE="$WORKSPACE/state"
+KEEP="${KEEP:-0}"
 CONFIG="$WORKSPACE/config.yaml"
 DAEMON_PID=""
 STUB_PID=""
@@ -16,7 +17,11 @@ cleanup() {
 	if [[ -n $STUB_PID ]]; then
 		kill -TERM "$STUB_PID" 2>/dev/null || true
 	fi
-	rm -rf "$WORKSPACE"
+	if [[ $KEEP == 1 ]]; then
+		printf 'kept frontend service workspace: %s\n' "$WORKSPACE" >&2
+	else
+		rm -rf "$WORKSPACE"
+	fi
 }
 trap cleanup EXIT INT TERM
 
@@ -67,6 +72,7 @@ agents:
   - name: chaz
     model: stub
     system_prompt: test fixture
+    default_memory_banks: [shared-notes]
 default_agents: [chaz]
 EOF
 
@@ -116,6 +122,34 @@ grep -q 'Name: from-client-a' "$WORKSPACE/client-b.out" ||
 jq -e '.per_session[] | select(.name == "from-client-a")' "$WORKSPACE/final-usage.json" \
 	>/dev/null || fail "usage did not see the command client's session"
 
+# Hosted entities a client cannot classify for itself. A connected Instance
+# must prove each per-DB key before it may read that tree, so its catalog walk
+# yields nothing; the daemon's published peer-local index is the only way these
+# reach a frontend. Memory banks are the load-bearing case — without the index
+# the memory extension resolves no bank and every memory tool fails.
+"$CHAZ_BIN" --config "$CONFIG" cmd '/agents' >"$WORKSPACE/hosted-agents.out" \
+	2>"$WORKSPACE/hosted-agents.err" || fail "hosted agent index client failed"
+grep -q 'chaz' "$WORKSPACE/hosted-agents.out" ||
+	fail "client did not see the daemon's hosted agent index"
+"$CHAZ_BIN" --config "$CONFIG" cmd '/memory list' --session print-shared \
+	>"$WORKSPACE/hosted-banks.out" 2>"$WORKSPACE/hosted-banks.err" ||
+	fail "hosted memory bank index client failed"
+grep -q 'shared-notes' "$WORKSPACE/hosted-banks.out" ||
+	fail "client did not see the daemon's hosted memory bank index"
+
+# A client's build must not overwrite the daemon's published catalog with its
+# own empty pre-hydration view. A later independent client must still see both.
+"$CHAZ_BIN" --config "$CONFIG" cmd '/agents' --session print-shared \
+	>"$WORKSPACE/hosted-agents-again.out" 2>"$WORKSPACE/hosted-agents-again.err" ||
+	fail "later hosted agent index client failed"
+grep -q 'chaz' "$WORKSPACE/hosted-agents-again.out" ||
+	fail "a client overwrote the daemon's hosted agent index"
+"$CHAZ_BIN" --config "$CONFIG" cmd '/memory list' --session print-shared \
+	>"$WORKSPACE/hosted-banks-again.out" 2>"$WORKSPACE/hosted-banks-again.err" ||
+	fail "later hosted memory bank index client failed"
+grep -q 'shared-notes' "$WORKSPACE/hosted-banks-again.out" ||
+	fail "a client overwrote the daemon's hosted memory bank index"
+
 # Closest deterministic headless equivalent to daemon+TUI coexistence: the
 # TUI and cmd share exactly this bootstrap/build/session stack, while cmd avoids
 # requiring a pseudo-terminal.
@@ -132,4 +166,5 @@ DAEMON_PID=""
 printf 'PASS — 8 concurrent frontends converged on one detached daemon\n'
 printf 'PASS — --print completed a real callback-driven turn over the service\n'
 printf 'PASS — command and usage clients had bidirectional state visibility\n'
+printf 'PASS — clients read the hosted agent and memory bank indices over the service\n'
 printf 'PASS — headless frontend coexistence preserved sole daemon ownership\n'
