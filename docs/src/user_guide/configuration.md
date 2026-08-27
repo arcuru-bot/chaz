@@ -156,6 +156,7 @@ web_search:
 # service:
 #   enabled: true
 #   path: /run/user/1000/chaz/eidetica.sock   # default <state_dir>/eidetica.sock
+#   # A relative path, such as run/eidetica.sock, is under <state_dir>/run/.
 #   # service.path must sit inside a directory dedicated to this chaz peer:
 #   # eidetica chmods the socket's parent directory to 0700 on startup.
 
@@ -487,12 +488,13 @@ service:
 ```
 
 - The socket defaults to `<state_dir>/eidetica.sock`, beside the database it fronts, rather than eidetica's per-user `$XDG_RUNTIME_DIR/eidetica/service.sock`. One user runs several chaz peers — a daemon and one or more transport bridges — and each owns a separate backend.
+- An absolute custom `service.path` is used as written, and `~/...` expands to the home directory. A relative custom path is resolved from `<state_dir>`, not the process working directory, so a daemon and every local frontend name the same socket.
 - Serving the socket makes its parent directory owner-only (mode `0700`); the socket itself is `0600`. Reaching it is reaching the daemon's own Instance, with everything that implies: sessions, transcripts, credentials, share tickets. Filesystem permissions are the whole authorization boundary.
 - A custom `service.path` must point inside a directory dedicated to this chaz peer. Chaz creates an absent parent with mode `0700`, but refuses an existing parent with any other mode instead of chmodding a possibly shared directory. The default `<state_dir>` is already dedicated and owner-only.
-- A second daemon on the same state directory refuses to start, before it opens the database. The interlock is a `flock` on `<state_dir>/daemon.lock` held for the daemon's life, so two daemons starting at the same instant cannot both conclude they are first, and a crashed daemon leaves no lock to clean up. A live socket at the configured path is a second, independent refusal — eidetica's service server unlinks whatever socket it finds rather than checking.
+- A second daemon on the same state directory refuses to start, before it opens the database, even if `service.enabled: false`. The interlock is a `flock` on `<state_dir>/daemon.lock` held for the daemon's life, so two daemons starting at the same instant cannot both conclude they are first, and a crashed daemon leaves no lock to clean up. A live socket at the configured path is a second, independent refusal — eidetica's service server unlinks whatever socket it finds rather than checking.
 - The socket is unlinked on clean shutdown (Ctrl-C or SIGTERM). A socket file nobody is listening on is a crash leftover and counts as no daemon at all.
 
-`chaz cmd`, the TUI, `--print`, and `chaz usage` all use this path. A frontend that finds no daemon starts one in a detached session and connects to it. Exactly one of N frontends racing on a cold state directory starts a daemon — a `flock` on `<state_dir>/daemon-start.lock` decides which — and the rest wait for its socket. Readiness requires both a successful async connection and mode `0600`. A start failure or timeout is an error to the caller; there is no direct-open fallback.
+`chaz cmd`, the TUI, `--print`, and `chaz usage` all use this path. A frontend that finds no daemon starts one in a detached session and connects to it. Exactly one of N frontends racing on a cold state directory starts a daemon — a `flock` on `<state_dir>/daemon-start.lock` decides which — and the rest wait for its socket. Readiness requires both a successful async connection and mode `0600`. If a manually started daemon has bound the socket but has not chmodded it yet, its `daemon.lock` makes clients wait rather than unlinking the live socket. A start failure or timeout is an error to the caller; there is no direct-open fallback.
 
 The transport bridges are unaffected — `chaz-matrix` and `chaz-discord` remain separate peers with their own state directories and backends, joined by sync rather than by sharing a database.
 

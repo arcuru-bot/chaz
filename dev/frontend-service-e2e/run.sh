@@ -8,11 +8,15 @@ STATE="$WORKSPACE/state"
 KEEP="${KEEP:-0}"
 CONFIG="$WORKSPACE/config.yaml"
 DAEMON_PID=""
+DISABLED_DAEMON_PID=""
 STUB_PID=""
 
 cleanup() {
 	if [[ -n $DAEMON_PID ]]; then
 		kill -TERM "$DAEMON_PID" 2>/dev/null || true
+	fi
+	if [[ -n $DISABLED_DAEMON_PID ]]; then
+		kill -TERM "$DISABLED_DAEMON_PID" 2>/dev/null || true
 	fi
 	if [[ -n $STUB_PID ]]; then
 		kill -TERM "$STUB_PID" 2>/dev/null || true
@@ -163,8 +167,31 @@ wait_for "daemon shutdown" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
 DAEMON_PID=""
 [[ ! -e $STATE/eidetica.sock ]] || fail "clean shutdown left the service socket behind"
 
+# Disabling the local service does not relax sole-backend ownership. This
+# daemon has no socket to test, so a second invocation can only be excluded by
+# the state-directory daemon claim before it opens SQLite.
+DISABLED_STATE="$WORKSPACE/service-disabled-state"
+DISABLED_CONFIG="$WORKSPACE/service-disabled-config.yaml"
+sed "s|state_dir: \"$STATE\"|state_dir: \"$DISABLED_STATE\"|; s/enabled: true/enabled: false/" \
+	"$CONFIG" >"$DISABLED_CONFIG"
+"$CHAZ_BIN" --config "$DISABLED_CONFIG" daemon \
+	>"$WORKSPACE/service-disabled-daemon.out" 2>"$WORKSPACE/service-disabled-daemon.err" &
+DISABLED_DAEMON_PID="$!"
+wait_for "service-disabled daemon database" 30 test -f "$DISABLED_STATE/eidetica.db"
+kill -0 "$DISABLED_DAEMON_PID" 2>/dev/null || fail "service-disabled daemon exited unexpectedly"
+if "$CHAZ_BIN" --config "$DISABLED_CONFIG" daemon \
+	>"$WORKSPACE/service-disabled-second.out" 2>"$WORKSPACE/service-disabled-second.err"; then
+	fail "a second service-disabled daemon opened the same backend"
+fi
+grep -q 'refusing to start a second opener' "$WORKSPACE/service-disabled-second.err" ||
+	fail "service-disabled second daemon did not report the sole-opener refusal"
+kill -TERM "$DISABLED_DAEMON_PID"
+wait_for "service-disabled daemon shutdown" 30 sh -c "! kill -0 $DISABLED_DAEMON_PID 2>/dev/null"
+DISABLED_DAEMON_PID=""
+
 printf 'PASS — 8 concurrent frontends converged on one detached daemon\n'
 printf 'PASS — --print completed a real callback-driven turn over the service\n'
 printf 'PASS — command and usage clients had bidirectional state visibility\n'
 printf 'PASS — clients read the hosted agent and memory bank indices over the service\n'
 printf 'PASS — headless frontend coexistence preserved sole daemon ownership\n'
+printf 'PASS — service-disabled daemons still exclude a second backend opener\n'

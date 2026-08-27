@@ -155,7 +155,14 @@ fn resolve_service_socket(config: &Config, state_dir: Option<&std::path::Path>) 
             .as_ref()
             .and_then(|service| service.path.as_ref())
         {
-            Some(path) => agent::expand_home(std::path::Path::new(path)),
+            Some(path) => {
+                let path = agent::expand_home(std::path::Path::new(path));
+                if path.is_relative() {
+                    state_dir.map_or(path.clone(), |dir| dir.join(path))
+                } else {
+                    path
+                }
+            }
             None => state_dir
                 .map(|d| d.join("eidetica.sock"))
                 .unwrap_or_else(|| PathBuf::from("eidetica.sock")),
@@ -508,10 +515,9 @@ async fn main() -> anyhow::Result<()> {
     // the probe below before the other binds and then steal each other's
     // socket. The probe covers whatever else is bound at the path that never
     // took the claim.
-    let _daemon_claim = match &service_socket {
-        Some(_) => Some(claim_daemon_role(state_dir.as_deref())?),
-        None => None,
-    };
+    let _daemon_claim = daemon_mode
+        .then(|| claim_daemon_role(state_dir.as_deref()))
+        .transpose()?;
     let _socket_claim = match &service_socket {
         Some(socket) => Some(claim_service_socket(socket)?),
         None => None,
@@ -895,6 +901,24 @@ mod tests {
     }
 
     #[test]
+    fn relative_service_socket_is_resolved_against_the_state_directory() {
+        let state = PathBuf::from("/var/lib/chaz");
+        let config = Config {
+            service: Some(ServiceConfig {
+                enabled: true,
+                path: Some("run/eidetica.sock".into()),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_service_socket(&config, Some(&state)),
+            Some(state.join("run/eidetica.sock")),
+            "a daemon and its clients must not resolve a configured relative path from their separate working directories"
+        );
+    }
+
+    #[test]
     fn a_second_daemon_cannot_take_the_claim() {
         let tmp = tempfile::tempdir().unwrap();
 
@@ -910,6 +934,29 @@ mod tests {
         // daemon start — which is what makes a restart work.
         drop(first);
         claim_daemon_role(Some(tmp.path())).expect("the claim is free once the holder is gone");
+    }
+
+    #[test]
+    fn service_disabled_daemons_still_exclude_a_second_backend_opener() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config {
+            service: Some(ServiceConfig {
+                enabled: false,
+                path: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_service_socket(&config, Some(tmp.path())), None);
+
+        let first = claim_daemon_role(Some(tmp.path()))
+            .expect("a service-disabled daemon still claims its state directory");
+        let err = claim_daemon_role(Some(tmp.path()))
+            .expect_err("a second service-disabled daemon must not open the backend");
+        assert!(
+            format!("{err}").contains("refusing to start a second opener"),
+            "unhelpful error: {err}"
+        );
+        drop(first);
     }
 
     #[test]
