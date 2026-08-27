@@ -10,22 +10,43 @@ CONFIG="$WORKSPACE/config.yaml"
 DAEMON_PID=""
 DISABLED_DAEMON_PID=""
 STUB_PID=""
+CLEANUP_REGRESSION="${CLEANUP_REGRESSION:-0}"
+CLEANUP_REGRESSION_DAEMON_ADOPTED=0
+
+terminate_and_wait() {
+	local pid="$1" what="$2"
+	[[ -n $pid ]] || return 0
+	kill -TERM "$pid" 2>/dev/null || true
+	for _ in $(seq 1 50); do
+		kill -0 "$pid" 2>/dev/null || return 0
+		sleep 0.1
+	done
+	kill -KILL "$pid" 2>/dev/null || true
+	for _ in $(seq 1 50); do
+		kill -0 "$pid" 2>/dev/null || return 0
+		sleep 0.1
+	done
+	printf 'cleanup could not stop %s (pid %s)\n' "$what" "$pid" >&2
+	return 1
+}
 
 cleanup() {
-	if [[ -n $DAEMON_PID ]]; then
-		kill -TERM "$DAEMON_PID" 2>/dev/null || true
-	fi
-	if [[ -n $DISABLED_DAEMON_PID ]]; then
-		kill -TERM "$DISABLED_DAEMON_PID" 2>/dev/null || true
-	fi
-	if [[ -n $STUB_PID ]]; then
-		kill -TERM "$STUB_PID" 2>/dev/null || true
+	local status=$? cleanup_failed=0
+	terminate_and_wait "$DAEMON_PID" "service daemon" || cleanup_failed=1
+	terminate_and_wait "$DISABLED_DAEMON_PID" "service-disabled daemon" || cleanup_failed=1
+	terminate_and_wait "$STUB_PID" "stub LLM" || cleanup_failed=1
+	if [[ $CLEANUP_REGRESSION == 1 && $CLEANUP_REGRESSION_DAEMON_ADOPTED == 1 && $cleanup_failed -eq 0 ]]; then
+		printf 'PASS — forced post-autostart failure left no service daemon\n' >&2
 	fi
 	if [[ $KEEP == 1 ]]; then
 		printf 'kept frontend service workspace: %s\n' "$WORKSPACE" >&2
 	else
 		rm -rf "$WORKSPACE"
 	fi
+	if ((cleanup_failed)); then
+		exit 1
+	fi
+	exit "$status"
 }
 trap cleanup EXIT INT TERM
 
@@ -45,6 +66,24 @@ wait_for() {
 		sleep 0.05
 	done
 	fail "timed out waiting for $what"
+}
+
+daemon_pid_for_socket() {
+	ss -xlpn | awk -v socket="$STATE/eidetica.sock" '
+		index($0, socket) && match($0, /pid=[0-9]+/) { pid = substr($0, RSTART + 4, RLENGTH - 4) }
+		END { print pid }
+	'
+}
+
+adopt_daemon() {
+	local deadline=$((SECONDS + 30))
+	while ((SECONDS < deadline)); do
+		DAEMON_PID="$(daemon_pid_for_socket)"
+		[[ -n $DAEMON_PID ]] && return 0
+		sleep 0.05
+	done
+	DAEMON_PID=""
+	return 1
 }
 
 STUB_PORT="$(python3 - <<'PY'
@@ -87,21 +126,22 @@ for i in $(seq 1 8); do
 		2>"$WORKSPACE/usage-$i.err" &
 	pids+=("$!")
 done
+adopt_daemon || fail "no daemon owns the service socket"
+CLEANUP_REGRESSION_DAEMON_ADOPTED=1
 for pid in "${pids[@]}"; do
 	wait "$pid" || fail "a concurrent usage client failed"
 done
-wait_for "service socket" 30 test -S "$STATE/eidetica.sock"
+[[ -S $STATE/eidetica.sock ]] || fail "service socket was removed before clients completed"
 [[ $(stat -c %a "$STATE/eidetica.sock") == 600 ]] || fail "service socket is not mode 0600"
 [[ $(stat -c %a "$STATE") == 700 ]] || fail "state directory is not mode 0700"
-DAEMON_PID="$(ss -xlpn | awk -v socket="$STATE/eidetica.sock" '
-	index($0, socket) && match($0, /pid=[0-9]+/) { pid = substr($0, RSTART + 4, RLENGTH - 4) }
-	END { print pid }
-')"
-[[ -n $DAEMON_PID ]] || fail "no daemon owns the service socket"
 [[ $(ps -o sid= -p "$DAEMON_PID" | tr -d ' ') == "$DAEMON_PID" ]] ||
 	fail "auto-started daemon did not detach into its own session"
 [[ $(pgrep -fc "^.*/${CHAZ_BIN##*/} --config $CONFIG daemon$") == 1 ]] ||
 	fail "concurrent clients started more than one daemon"
+
+if [[ $CLEANUP_REGRESSION == 1 ]]; then
+	fail "forced post-autostart failure"
+fi
 
 # `--print` exercises the callback-driven frontend path against the daemon's
 # Instance. A subsequent command reads the same named session.
