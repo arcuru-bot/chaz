@@ -225,7 +225,6 @@ async fn main() -> anyhow::Result<()> {
             bootstrap_agents_from_config: false,
             // Dumb bridge: proxy + deliver only. The daemon runs agents.
             run_agent_loop: false,
-            extra_auto_approved_tools: Vec::new(),
             // Long-lived: MCP tools land whenever their servers finish.
             mcp_readiness: server::McpReadiness::Deferred,
         },

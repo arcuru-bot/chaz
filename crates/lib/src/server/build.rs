@@ -59,10 +59,6 @@ pub struct BuildOptions {
     /// exposed sessions and runs them. Distinct from `run_routine_engine`,
     /// which only gates schedulers/heartbeats, not the ReAct message loop.
     pub run_agent_loop: bool,
-    /// Tools to add to the auto-approved set on top of `config.security`. The
-    /// CLI passes its non-interactive allowlist here so `shell`/`write_file`
-    /// work under `--print` where there is no interactive approval.
-    pub extra_auto_approved_tools: Vec<String>,
     /// Whether a turn may run before the configured MCP servers have
     /// finished starting. See [`McpReadiness`].
     pub mcp_readiness: McpReadiness,
@@ -417,16 +413,12 @@ pub async fn build(
         _ => security::LeakPolicy::Redact,
     };
     let leak_detector = security::LeakDetector::new(leak_policy);
-    let mut auto_approved: std::collections::HashSet<String> = sec
+    let auto_approved: std::collections::HashSet<String> = sec
         .auto_approved_tools
         .clone()
         .unwrap_or_default()
         .into_iter()
         .collect();
-
-    // Caller-supplied extras (the CLI's non-interactive allowlist under
-    // `--print`, where shell/write_file have no interactive approval).
-    auto_approved.extend(opts.extra_auto_approved_tools);
 
     let security_ctx = security::SecurityContext {
         leak_detector,

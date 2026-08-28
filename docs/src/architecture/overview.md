@@ -81,10 +81,12 @@ daemon remains the sole embedded-backend opener, sync owner, agent runtime, and
 routine owner. Transport bridges remain separate peers with separate backends.
 
 The connected `Instance` preserves the storage API used above the bootstrap
-seam. Frontends never start a sync engine or routine engine. TUI and `--print`
-retain the runtime for the local session they register; `cmd` and `usage` run no
-agent loop. The daemon runs its own registered sessions, including sessions
-exposed by transport bridges.
+seam. Frontends never start a sync engine, routine engine, or agent loop. The
+daemon watches and owns every local frontend session. It separately adopts and
+owns eligible sessions exposed by transport bridges. It relays local TUI approval
+requests through the session DB, so a reopened TUI can render an unresolved
+request and return its decision to the daemon; unanswered requests expire at the
+daemon's configured timeout.
 
 ### Server
 

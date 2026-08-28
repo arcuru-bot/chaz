@@ -1150,8 +1150,10 @@ async fn setup_session(
 
     let notify_id = session_db_id.clone();
     let approval_db = session_db.clone();
-    let seen_approvals = Arc::new(StdMutex::new(HashSet::<String>::new()));
     let pending_approvals = Arc::new(StdMutex::new(HashSet::<String>::new()));
+    let scan_approval_db = approval_db.clone();
+    let scan_approval_tx = approval_tx.clone();
+    let scan_pending = pending_approvals.clone();
     session_db
         .on_write(move |event, _db| {
             // Source-agnostic: daemon writes arrive over the service socket
@@ -1161,90 +1163,112 @@ async fn setup_session(
             let approval_tx = approval_tx.clone();
             let id = notify_id.clone();
             let db = approval_db.clone();
-            let seen = seen_approvals.clone();
             let pending = pending_approvals.clone();
             Box::pin(async move {
                 let _ = tx.send(id.clone()).await;
-                let session = Session::new(
-                    chaz_core::types::ConversationId(id.clone()),
-                    db.clone(),
-                )
-                .await;
-                let decided = chaz_core::bridge::resolved_decisions(session.entries());
-                let requests = {
-                    let mut seen = seen.lock().unwrap_or_else(|p| p.into_inner());
-                    let pending = pending.lock().unwrap_or_else(|p| p.into_inner());
-                    session
-                        .entries()
-                        .iter()
-                        .filter_map(chaz_core::bridge::parse_approval_request)
-                        .filter(|request| {
-                            !decided.contains_key(&request.request_id)
-                                && !pending.contains(&request.request_id)
-                                && seen.insert(request.request_id.clone())
-                        })
-                        .collect::<Vec<_>>()
-                };
-                for request in requests {
-                    let request_id = request.request_id.clone();
-                    let (decision_tx, decision_rx) = oneshot::channel();
-                    let tagged = TaggedApproval {
-                        session_db_id: id.clone(),
-                        request_id: request_id.clone(),
-                        exchange: ApprovalExchange {
-                            info: chaz_core::bridge::approval_info_from_payload(&request),
-                            decision_tx,
-                        },
-                    };
-                    if approval_tx.send(tagged).await.is_err() {
-                        return Ok(());
-                    }
-                    pending
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .insert(request_id.clone());
-                    let db = db.clone();
-                    let pending = pending.clone();
-                    tokio::spawn(async move {
-                        let Ok(decision) = decision_rx.await else {
-                            pending
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .remove(&request_id);
-                            return;
-                        };
-                        let mut session = Session::new(
-                            chaz_core::types::ConversationId(db.root_id().to_string()),
-                            db,
-                        )
-                        .await;
-                        if chaz_core::bridge::existing_decision(
-                            session.entries(),
-                            &request_id,
-                        )
-                        .is_none()
-                        {
-                            let _ = session
-                                .add_entry(chaz_core::bridge::approval_decision_entry(
-                                    "local-user",
-                                    &request_id,
-                                    decision,
-                                ))
-                                .await;
-                        }
-                        pending
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .remove(&request_id);
-                    });
-                }
+                relay_pending_approvals(db, id, approval_tx, pending).await;
                 Ok(())
             })
         })
         .await?
         .detach();
 
+    relay_pending_approvals(
+        scan_approval_db,
+        session_db_id,
+        scan_approval_tx,
+        scan_pending,
+    )
+    .await;
+
     Ok(())
+}
+
+/// Scan a session for unresolved daemon approval requests and relay every
+/// request not already waiting for this TUI process.
+async fn relay_pending_approvals(
+    db: eidetica::Database,
+    session_db_id: String,
+    approval_tx: mpsc::Sender<TaggedApproval>,
+    pending: Arc<StdMutex<HashSet<String>>>,
+) {
+    let session = Session::new(
+        chaz_core::types::ConversationId(session_db_id.clone()),
+        db.clone(),
+    )
+    .await;
+    let decided = chaz_core::bridge::resolved_decisions(session.entries());
+    let requests = {
+        let pending = pending.lock().unwrap_or_else(|p| p.into_inner());
+        session
+            .entries()
+            .iter()
+            .filter_map(chaz_core::bridge::parse_approval_request)
+            .filter(|request| {
+                !decided.contains_key(&request.request_id) && !pending.contains(&request.request_id)
+            })
+            .collect::<Vec<_>>()
+    };
+    for request in requests {
+        let request_id = request.request_id.clone();
+        // Reserve before the await below so overlapping scans cannot enqueue
+        // the same request twice. A failed delivery removes the reservation,
+        // leaving the request available for a later scan.
+        if !pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(request_id.clone())
+        {
+            continue;
+        }
+        let (decision_tx, decision_rx) = oneshot::channel();
+        let tagged = TaggedApproval {
+            session_db_id: session_db_id.clone(),
+            request_id: request_id.clone(),
+            exchange: ApprovalExchange {
+                info: chaz_core::bridge::approval_info_from_payload(&request),
+                decision_tx,
+            },
+        };
+        if approval_tx.send(tagged).await.is_err() {
+            pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&request_id);
+            continue;
+        }
+        let db = db.clone();
+        let pending = pending.clone();
+        tokio::spawn(async move {
+            let Ok(decision) = decision_rx.await else {
+                pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&request_id);
+                return;
+            };
+            let mut session = Session::new(
+                chaz_core::types::ConversationId(db.root_id().to_string()),
+                db,
+            )
+            .await;
+            if chaz_core::bridge::existing_decision(session.entries(), &request_id).is_none()
+                && let Err(e) = session
+                    .add_entry(chaz_core::bridge::approval_decision_entry(
+                        "local-user",
+                        &request_id,
+                        decision,
+                    ))
+                    .await
+            {
+                tracing::error!(%request_id, "Failed to record local approval decision: {e}");
+            }
+            pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&request_id);
+        });
+    }
 }
 
 /// Find an existing session named "tui", or create one and name it.
@@ -2243,4 +2267,154 @@ pub(super) fn show_error(app: &mut App, content: String) {
         metadata: None,
         routing: None,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chaz_core::bridge::approval_request_entry;
+    use chaz_core::tool::{RiskLevel, ToolApprovalInfo};
+    use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
+    use std::collections::HashMap;
+
+    async fn test_db() -> (
+        eidetica::Instance,
+        eidetica::Database,
+        mpsc::Sender<TaggedApproval>,
+        mpsc::Receiver<TaggedApproval>,
+    ) {
+        let (instance, mut user) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("test"))
+                .await
+                .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(2);
+        (instance, db, tx, rx)
+    }
+
+    async fn add_request(db: &eidetica::Database) -> String {
+        let info = ToolApprovalInfo {
+            name: "shell".to_string(),
+            arguments_display: "ls".to_string(),
+            risk_level: RiskLevel::High,
+        };
+        let (request_id, entry) =
+            approval_request_entry("daemon", &info, std::time::Duration::from_secs(60));
+        let mut session = Session::new(
+            chaz_core::types::ConversationId(db.root_id().to_string()),
+            db.clone(),
+        )
+        .await;
+        session.add_entry(entry).await.unwrap();
+        request_id
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_is_relayed_on_a_later_scan() {
+        let (_instance, db, tx, rx) = test_db().await;
+        let request_id = add_request(&db).await;
+        let pending = Arc::new(StdMutex::new(HashSet::new()));
+
+        drop(rx);
+        relay_pending_approvals(db.clone(), db.root_id().to_string(), tx, pending.clone()).await;
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "failed delivery must not mark request seen"
+        );
+
+        let (tx, mut rx) = mpsc::channel(1);
+        relay_pending_approvals(db.clone(), db.root_id().to_string(), tx, pending).await;
+        let tagged = rx.recv().await.expect("later scan must retry delivery");
+        assert_eq!(tagged.request_id, request_id);
+        let _ = tagged
+            .exchange
+            .decision_tx
+            .send(chaz_core::bridge::ApprovalDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn setup_scan_surfaces_a_preexisting_request_once() {
+        let (instance, mut user) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("test"))
+                .await
+                .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let request_id = add_request(&db).await;
+
+        let (tx, mut rx) = mpsc::channel(2);
+        let agents = Arc::new(chaz_core::agent::AgentRegistry::from_config(
+            &Config::default(),
+        ));
+        let registry = Arc::new(
+            chaz_core::session::SessionRegistry::new(instance.clone(), user, agents.clone())
+                .await
+                .unwrap(),
+        );
+        let secrets = chaz_core::security::SecretStore::new(registry.chaz_peer().clone()).await;
+        let backend = BackendManager::new(&None, secrets);
+        let server = Server::new(
+            registry,
+            agents,
+            chaz_core::hosted_index::HostedIndex::empty("agent"),
+            chaz_core::hosted_index::HostedIndex::empty("bank"),
+            chaz_core::hosted_index::HostedIndex::empty("skill_bank"),
+            Arc::new(chaz_core::tool::ToolRegistry::new()),
+            Arc::new(chaz_core::tool::ToolPolicyRegistry::empty()),
+            chaz_core::security::SecurityContext {
+                leak_detector: chaz_core::security::LeakDetector::new(
+                    chaz_core::security::LeakPolicy::default(),
+                ),
+                auto_approved_tools: Default::default(),
+                approval_callback: None,
+            },
+            HashMap::new(),
+            Default::default(),
+            Arc::new(chaz_core::tool_host::NativeToolHost::new()),
+            Arc::new(chaz_core::extension::ExtensionHub::new()),
+            backend.clone(),
+            Arc::new(chaz_core::mcp::McpRegistry::new()),
+            false,
+        );
+        setup_session(&server, &db, backend, tx.clone(), mpsc::channel(1).0)
+            .await
+            .unwrap();
+        let tagged = rx.recv().await.expect("preexisting request must surface");
+        assert_eq!(tagged.request_id, request_id);
+
+        let mut session = Session::new(
+            chaz_core::types::ConversationId(db.root_id().to_string()),
+            db.clone(),
+        )
+        .await;
+        session
+            .add_entry(SessionEntry {
+                sender: "daemon".to_string(),
+                content: String::new(),
+                timestamp: chrono::Utc::now(),
+                entry_type: EntryType::Ack,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "a later write must not duplicate the prompt"
+        );
+        let _ = tagged
+            .exchange
+            .decision_tx
+            .send(chaz_core::bridge::ApprovalDecision::Deny);
+    }
 }

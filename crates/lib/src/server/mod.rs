@@ -1911,8 +1911,19 @@ impl Server {
             if !claimed {
                 continue;
             }
+            let approval_tx = approval_proxy::spawn_session_db_approval_proxy(
+                session_db.clone(),
+                "daemon".to_string(),
+                self.approval_timeout(),
+            )
+            .await;
             if let Err(e) = self
-                .watch_session(&session_db, self.default_backend.clone(), None, None)
+                .watch_session(
+                    &session_db,
+                    self.default_backend.clone(),
+                    None,
+                    Some(approval_tx),
+                )
                 .await
             {
                 self.runtime_lease.release(&event.session_db_id);

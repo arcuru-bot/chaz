@@ -569,20 +569,6 @@ async fn main() -> anyhow::Result<()> {
     // client see the daemon's writes instead of racing them.
     let service_instance = (daemon_mode && service_socket.is_some()).then(|| instance.clone());
 
-    // In non-interactive --print mode there is no approval UI; pass the
-    // configured (or default) CLI auto-approved tools so shell/write_file work
-    // in the one-shot loop. Long-lived modes leave the set empty (interactive
-    // approval governs).
-    let extra_auto_approved_tools = if args.print {
-        config
-            .cli
-            .as_ref()
-            .map(|c| c.auto_approved_tools.clone())
-            .unwrap_or_else(config::default_cli_auto_approved)
-    } else {
-        Vec::new()
-    };
-
     // Assemble the fully-wired server (registry, agent DBs, secret store,
     // extension hub, schedules, routine engine) from the opened eidetica
     // instance. Sync and the routine engine are long-lived and skipped for a
@@ -608,7 +594,6 @@ async fn main() -> anyhow::Result<()> {
             // transports over the connected Instance: they create/open
             // sessions, write input, render output, and relay approvals.
             run_agent_loop: daemon_mode,
-            extra_auto_approved_tools,
             // Only the daemon runs a turn, so frontend startup never waits
             // for its own MCP registry. The daemon's long-lived registry
             // settles independently before it executes a tool-bearing turn.

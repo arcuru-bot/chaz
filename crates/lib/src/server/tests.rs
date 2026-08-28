@@ -1528,6 +1528,81 @@ async fn watch_session_is_transport_only_no_runtime_claim() {
 }
 
 #[tokio::test]
+async fn daemon_adoption_installs_the_session_db_approval_proxy() {
+    let (_instance, server, registry) = server_fixture().await;
+    server.set_approval_timeout(std::time::Duration::from_secs(1));
+    let (_conversation_id, session_db) = registry.create_session(Some("tui")).await.unwrap();
+    let session_db_id = session_db.root_id().to_string();
+
+    let watcher = tokio::spawn({
+        let server = server.clone();
+        async move { server.new_session_watcher().await }
+    });
+    for _ in 0..100 {
+        if server.is_watching_session(&session_db_id).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(server.is_watching_session(&session_db_id).await);
+
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+    let security = SecurityContext {
+        leak_detector: crate::security::LeakDetector::new(crate::security::LeakPolicy::default()),
+        auto_approved_tools: Default::default(),
+        approval_callback: Some(approval_tx),
+    };
+    let ask = crate::tool::ToolApprovalInfo {
+        name: "shell".to_string(),
+        arguments_display: "ls".to_string(),
+        risk_level: crate::tool::RiskLevel::High,
+    };
+    let decision = tokio::spawn(async move { security.request_approval(ask).await });
+    let exchange = approval_rx.recv().await.expect("test asks approval");
+    let runtime_tx = {
+        let sessions = server.sessions.lock().await;
+        sessions
+            .get(&session_db_id)
+            .and_then(|runtime| runtime.approval_tx.clone())
+            .expect("daemon adoption installs an approval proxy")
+    };
+    runtime_tx.send(exchange).await.unwrap();
+
+    let mut session = Session::new(ConversationId(session_db_id), session_db.clone()).await;
+    for _ in 0..100 {
+        if let Some(request) = session
+            .entries()
+            .iter()
+            .find_map(crate::bridge::parse_approval_request)
+        {
+            assert_eq!(request.timeout_secs, 1, "proxy uses the daemon timeout");
+            session
+                .add_entry(crate::bridge::approval_decision_entry(
+                    "local-user",
+                    &request.request_id,
+                    crate::bridge::ApprovalDecision::Approve,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                decision.await.unwrap(),
+                crate::bridge::ApprovalDecision::Approve
+            );
+            watcher.abort();
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        session = Session::new(
+            ConversationId(session_db.root_id().to_string()),
+            session_db.clone(),
+        )
+        .await;
+    }
+    watcher.abort();
+    panic!("daemon approval proxy did not persist a request");
+}
+
+#[tokio::test]
 async fn claim_runtime_fires_exactly_once_second_caller_errors() {
     let (_instance, server, registry) = server_fixture().await;
     let (session_db, backend) = fresh_session_and_backend(&registry).await;
