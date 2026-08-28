@@ -232,8 +232,19 @@ impl Server {
         // 3. Acquire the processing lock (skip if session is busy).
         //    Release at the end of this scope via the deferred block.
         {
+            // High-water mark for the wake gate: entries already in the
+            // session when this fire claimed it. A durable message arriving
+            // past this point is what earns a follow-up turn; the fire's own
+            // writes do not. See `ProcessingState`.
+            let covered = crate::session::Session::new(
+                crate::types::ConversationId(session_db_id.clone()),
+                session_db.clone(),
+            )
+            .await
+            .entries()
+            .len();
             let mut processing = self.processing.lock().await;
-            if !processing.active.insert(session_db_id.clone()) {
+            if processing.active.contains_key(&session_db_id) {
                 tracing::debug!(
                     session = %session_db_id,
                     schedule = %payload.schedule_id,
@@ -241,6 +252,7 @@ impl Server {
                 );
                 return Ok(());
             }
+            processing.active.insert(session_db_id.clone(), covered);
         }
 
         // 4. Load the agent + build context + run the turn.

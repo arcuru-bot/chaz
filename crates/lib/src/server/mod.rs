@@ -161,13 +161,74 @@ struct SpawnContext {
     notify_tx: mpsc::Sender<String>,
 }
 
-/// Per-session turn state. `pending` records a processable durable write that
-/// arrived while a turn was active; it is consumed by the next turn even if
-/// the just-completed agent reply is now the latest entry.
+/// Per-session turn state.
+///
+/// `active` maps a session to the number of entries the running turn's
+/// context covers — its high-water mark, taken from the snapshot the turn was
+/// built on. `pending` records a processable durable write that arrived
+/// *beyond* that mark, so it is consumed by the next turn even though the
+/// just-completed agent reply is now the latest entry.
+///
+/// The high-water mark is what keeps the wake honest. Every write on a
+/// watched session fires the callback, including the turn's own ack and
+/// reply, and a callback that re-read only the latest entry could still see
+/// the user message the running turn is already answering. Recording it as
+/// pending on that basis re-runs the same turn: a second model call and a
+/// second reply into the room. Comparing against the mark distinguishes "the
+/// message this turn is answering" from "a message that arrived after it
+/// captured context", which is the only one that needs another turn.
 #[derive(Default)]
 struct ProcessingState {
-    active: std::collections::HashSet<String>,
+    active: std::collections::HashMap<String, usize>,
     pending: std::collections::HashSet<String>,
+}
+
+/// Whether `entries` holds a turn-worthy entry at or beyond `covered` — a
+/// `Directive`, or a `Message` from a sender that is not a known agent.
+/// Mirrors the wake gate in [`Server::process_session`].
+fn has_processable_entry_beyond(
+    entries: &[crate::session::SessionEntry],
+    covered: usize,
+    is_agent: impl Fn(&str) -> bool,
+) -> bool {
+    entries.iter().skip(covered).any(|entry| {
+        matches!(entry.entry_type, EntryType::Directive)
+            || (entry.entry_type == EntryType::Message && !is_agent(&entry.sender))
+    })
+}
+
+#[cfg(test)]
+mod processing_state_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn entry(sender: &str, entry_type: EntryType) -> crate::session::SessionEntry {
+        crate::session::SessionEntry {
+            sender: sender.to_string(),
+            content: String::new(),
+            timestamp: Utc::now(),
+            entry_type,
+            metadata: None,
+            routing: None,
+        }
+    }
+
+    #[test]
+    fn pending_gate_ignores_the_message_already_covered_by_the_active_turn() {
+        let entries = [entry("user", EntryType::Message)];
+        assert!(!has_processable_entry_beyond(&entries, 1, |_| false));
+    }
+
+    #[test]
+    fn pending_gate_accepts_a_later_user_message_but_not_an_agent_reply() {
+        let entries = [
+            entry("user", EntryType::Message),
+            entry("alpha", EntryType::Message),
+            entry("user", EntryType::Message),
+        ];
+        assert!(has_processable_entry_beyond(&entries, 1, |name| name == "alpha"));
+        assert!(!has_processable_entry_beyond(&entries[..2], 1, |name| name == "alpha"));
+    }
 }
 
 /// Release a session's turn slot and re-wake the processing loop when a
@@ -890,7 +951,11 @@ impl Server {
 
     #[cfg(test)]
     async fn processing_contains(&self, session_db_id: &str) -> bool {
-        self.processing.lock().await.active.contains(session_db_id)
+        self.processing
+            .lock()
+            .await
+            .active
+            .contains_key(session_db_id)
     }
 
     #[cfg(test)]
@@ -906,7 +971,7 @@ impl Server {
 
     #[cfg(test)]
     async fn insert_processing_for_test(&self, session_db_id: String) {
-        self.processing.lock().await.active.insert(session_db_id);
+        self.processing.lock().await.active.insert(session_db_id, 0);
     }
 
     #[cfg(test)]
@@ -1567,13 +1632,13 @@ impl Server {
                     // agent reply may be the latest entry and otherwise hides
                     // this durable message from the normal latest-entry gate.
                     let session = Session::new(ConversationId(sid.clone()), db).await;
-                    if session.latest_entry().is_some_and(|entry| {
-                        matches!(entry.entry_type, EntryType::Directive)
-                            || (entry.entry_type == EntryType::Message
-                                && agents.get(&entry.sender).is_none())
-                    }) {
+                    {
                         let mut state = processing.lock().await;
-                        if state.active.contains(&sid) {
+                        if let Some(&covered) = state.active.get(&sid)
+                            && has_processable_entry_beyond(session.entries(), covered, |name| {
+                                agents.get(name).is_some()
+                            })
+                        {
                             state.pending.insert(sid.clone());
                             #[cfg(test)]
                             pending_notify.notify_one();
@@ -1771,13 +1836,15 @@ impl Server {
                     let db = db.clone();
                     Box::pin(async move {
                         let session = Session::new(ConversationId(sid.clone()), db).await;
-                        if session.latest_entry().is_some_and(|entry| {
-                            matches!(entry.entry_type, EntryType::Directive)
-                                || (entry.entry_type == EntryType::Message
-                                    && agents.get(&entry.sender).is_none())
-                        }) {
+                        {
                             let mut state = processing.lock().await;
-                            if state.active.contains(&sid) {
+                            if let Some(&covered) = state.active.get(&sid)
+                                && has_processable_entry_beyond(
+                                    session.entries(),
+                                    covered,
+                                    |name| agents.get(name).is_some(),
+                                )
+                            {
                                 state.pending.insert(sid.clone());
                                 #[cfg(test)]
                                 pending_notify.notify_one();
@@ -2057,9 +2124,12 @@ impl Server {
 
         {
             let mut processing = self.processing.lock().await;
-            if !processing.active.insert(session_db_id.to_string()) {
+            if processing.active.contains_key(session_db_id) {
                 return Ok(());
             }
+            processing
+                .active
+                .insert(session_db_id.to_string(), session.entries().len());
             // A completing turn woke us because a user write landed after it
             // captured context. Consume that durable wake only after we own
             // the active slot; wakes that find an active turn leave it set.

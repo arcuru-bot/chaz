@@ -1876,6 +1876,11 @@ async fn a_message_arriving_during_a_turn_gets_a_follow_up_turn() {
     let mock = Arc::new(MockBackend::new());
     mock.push_text("first reply");
     mock.push_text("second reply");
+    // A third response is intentionally available: the broken wake gate
+    // consumes it by answering `world` twice. Without it, the extra call can
+    // fail quickly and race this assertion, laundering a duplicate model
+    // request into a two-call green.
+    mock.push_text("duplicate reply");
     let gate = mock.block_next_call();
     let backend = crate::backends::BackendManager::with_mock(
         mock.clone(),
@@ -1905,11 +1910,22 @@ async fn a_message_arriving_during_a_turn_gets_a_follow_up_turn() {
     .expect("session write did not mark the follow-up turn pending");
     gate.release();
     for _ in 0..100 {
-        if mock.recorded_calls().len() == 2 {
+        if mock.recorded_calls().len() >= 2 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    // A self-write from the second turn must not enqueue a third copy of the
+    // same context. Wait until the second turn releases its slot, then give
+    // any erroneous wake one scheduler window to consume the deliberately
+    // queued third response.
+    for _ in 0..100 {
+        if !server.processing_contains(&sid).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let calls = mock.recorded_calls();
     assert_eq!(
         calls.len(),
@@ -1932,7 +1948,7 @@ async fn releasing_a_schedule_turn_wakes_its_pending_message() {
     let sid = "schedule-session";
     {
         let mut state = processing.lock().await;
-        state.active.insert(sid.to_string());
+        state.active.insert(sid.to_string(), 0);
         state.pending.insert(sid.to_string());
     }
 
@@ -1940,7 +1956,7 @@ async fn releasing_a_schedule_turn_wakes_its_pending_message() {
 
     assert_eq!(notify_rx.recv().await.as_deref(), Some(sid));
     assert!(
-        !processing.lock().await.active.contains(sid),
+        !processing.lock().await.active.contains_key(sid),
         "the schedule turn must release its active slot"
     );
 }

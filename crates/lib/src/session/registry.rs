@@ -430,11 +430,26 @@ impl SessionRegistry {
     }
 
     /// Open a session created by a local frontend through this daemon's
-    /// service connection. Such sessions use the user's default key, which
-    /// the daemon already holds, but the daemon's in-memory `UserKeyManager`
-    /// does not observe the client's newly-written per-DB mapping. Bind the
-    /// known default signing key directly instead of requiring that stale
-    /// client-local mapping.
+    /// service connection.
+    ///
+    /// `create_session` signs a local frontend's session with the user's
+    /// default key, which this daemon holds. The daemon's in-memory
+    /// `UserKeyManager` does not observe the client's newly-written per-DB
+    /// mapping, so `User::open_database` — which selects a key from that
+    /// mapping — cannot find one and the ordinary open path fails.
+    ///
+    /// Holding the default key is not on its own a reason to write as it.
+    /// Sessions also arrive from transport bridges, which are separate peers
+    /// that authorize their own keys; the daemon's default key is not a member
+    /// of those trees. Resolve the default key against the session's own
+    /// `_settings` auth and bind the resulting identity, so this path adopts a
+    /// session only when the tree itself grants the key write access. A
+    /// session that resolves to nothing (or to read-only) is left to the
+    /// bridge adoption path in `server::build`, which opens it under the key
+    /// that peer actually holds.
+    ///
+    /// The authority comes from the tree's auth settings, never from session
+    /// content, so a session writer cannot promote itself into this path.
     pub async fn open_local_frontend_session(
         &self,
         session_db_id: &str,
@@ -443,10 +458,28 @@ impl SessionRegistry {
             .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
         let user = self.user.lock().await;
         let default_key = user.get_default_key()?;
+        let (identity, permission) = Database::find_sigkeys(&self.instance, &root_id, &default_key)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Session {session_db_id} does not authorize this peer's default key"
+                )
+            })?;
+        if !permission.can_write() {
+            anyhow::bail!(
+                "Session {session_db_id} grants this peer's default key {permission:?}, \
+                 which cannot run a turn"
+            );
+        }
         let signing_key = user.get_signing_key(&default_key)?;
         let db = eidetica::Database::open(&self.instance, &root_id)
             .await?
-            .with_key(signing_key);
+            .with_key(eidetica::database::DatabaseKey::with_identity(
+                signing_key,
+                identity,
+            ));
         self.local_frontend_sessions
             .lock()
             .await
