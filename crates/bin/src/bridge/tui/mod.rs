@@ -33,7 +33,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
 
 mod bridge_impl;
@@ -72,9 +72,14 @@ impl TuiBridge {
     }
 }
 
-/// Approval routed from the server through a per-tab forwarder, tagged with
-/// the owning session DB ID so the TUI knows which tab to show the prompt on.
-pub(super) type TaggedApproval = (String, ApprovalExchange);
+/// Approval persisted by the daemon and surfaced by a local frontend, tagged
+/// with the owning session and request id so the answer can be written back to
+/// the same session DB.
+pub(super) struct TaggedApproval {
+    pub session_db_id: String,
+    pub request_id: String,
+    pub exchange: ApprovalExchange,
+}
 
 enum Action {
     Key(KeyEvent),
@@ -1129,10 +1134,9 @@ fn restore_terminal() {
     let _ = crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
-/// Register a session DB with the server and wire up per-tab notify and
-/// approval forwarding. The raw approval channel given to the server is
-/// per-session; a spawned forwarder tags each approval with the session_db_id
-/// and pushes into the shared TUI approval channel.
+/// Register a session DB as a transport-only frontend and relay the daemon's
+/// persisted approval requests into the TUI. Answers travel back as
+/// `ApprovalDecision` entries; the frontend never owns the agent runtime.
 async fn setup_session(
     server: &Server,
     session_db: &eidetica::Database,
@@ -1142,32 +1146,98 @@ async fn setup_session(
 ) -> anyhow::Result<()> {
     let session_db_id = session_db.root_id().to_string();
 
-    // Per-session raw approval channel → tagged forward to shared channel.
-    let (raw_tx, mut raw_rx) = mpsc::channel::<ApprovalExchange>(8);
-    let forwarder_id = session_db_id.clone();
-    let forwarder_tx = approval_tx.clone();
-    tokio::spawn(async move {
-        while let Some(ex) = raw_rx.recv().await {
-            if forwarder_tx.send((forwarder_id.clone(), ex)).await.is_err() {
-                break;
-            }
-        }
-    });
+    server.watch_frontend_session(session_db, backend).await?;
 
-    server
-        .register_session(session_db, backend, None, Some(raw_tx))
-        .await?;
-
-    let notify_id = session_db_id;
+    let notify_id = session_db_id.clone();
+    let approval_db = session_db.clone();
+    let seen_approvals = Arc::new(StdMutex::new(HashSet::<String>::new()));
+    let pending_approvals = Arc::new(StdMutex::new(HashSet::<String>::new()));
     session_db
         .on_write(move |event, _db| {
-            // Source-agnostic: a co-owner's message landing over sync should
-            // redraw the tab as readily as one typed here.
+            // Source-agnostic: daemon writes arrive over the service socket
+            // and must redraw the tab and surface approval requests.
             tracing::trace!(session = %notify_id, source = ?event.source(), "Session write; redrawing the tab");
             let tx = notify_tx.clone();
+            let approval_tx = approval_tx.clone();
             let id = notify_id.clone();
+            let db = approval_db.clone();
+            let seen = seen_approvals.clone();
+            let pending = pending_approvals.clone();
             Box::pin(async move {
-                let _ = tx.send(id).await;
+                let _ = tx.send(id.clone()).await;
+                let session = Session::new(
+                    chaz_core::types::ConversationId(id.clone()),
+                    db.clone(),
+                )
+                .await;
+                let decided = chaz_core::bridge::resolved_decisions(session.entries());
+                let requests = {
+                    let mut seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+                    let pending = pending.lock().unwrap_or_else(|p| p.into_inner());
+                    session
+                        .entries()
+                        .iter()
+                        .filter_map(chaz_core::bridge::parse_approval_request)
+                        .filter(|request| {
+                            !decided.contains_key(&request.request_id)
+                                && !pending.contains(&request.request_id)
+                                && seen.insert(request.request_id.clone())
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for request in requests {
+                    let request_id = request.request_id.clone();
+                    let (decision_tx, decision_rx) = oneshot::channel();
+                    let tagged = TaggedApproval {
+                        session_db_id: id.clone(),
+                        request_id: request_id.clone(),
+                        exchange: ApprovalExchange {
+                            info: chaz_core::bridge::approval_info_from_payload(&request),
+                            decision_tx,
+                        },
+                    };
+                    if approval_tx.send(tagged).await.is_err() {
+                        return Ok(());
+                    }
+                    pending
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(request_id.clone());
+                    let db = db.clone();
+                    let pending = pending.clone();
+                    tokio::spawn(async move {
+                        let Ok(decision) = decision_rx.await else {
+                            pending
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .remove(&request_id);
+                            return;
+                        };
+                        let mut session = Session::new(
+                            chaz_core::types::ConversationId(db.root_id().to_string()),
+                            db,
+                        )
+                        .await;
+                        if chaz_core::bridge::existing_decision(
+                            session.entries(),
+                            &request_id,
+                        )
+                        .is_none()
+                        {
+                            let _ = session
+                                .add_entry(chaz_core::bridge::approval_decision_entry(
+                                    "local-user",
+                                    &request_id,
+                                    decision,
+                                ))
+                                .await;
+                        }
+                        pending
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&request_id);
+                    });
+                }
                 Ok(())
             })
         })

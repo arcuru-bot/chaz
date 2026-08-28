@@ -451,7 +451,7 @@ async fn main() -> anyhow::Result<()> {
     // another terminal to follow live.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _file_log_guard = if daemon_mode {
+    let _file_log_guard = if daemon_mode && std::env::var_os("CHAZ_DAEMON_DETACHED").is_none() {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stdout)
@@ -459,10 +459,14 @@ async fn main() -> anyhow::Result<()> {
         None
     } else {
         let log_dir = state_dir.clone().unwrap_or_else(|| PathBuf::from("."));
-        let prefix = match (args.print, cmd_args.is_some()) {
-            (_, true) => "chaz-cmd",
-            (true, _) => "chaz-cli",
-            _ => "chaz-tui",
+        let prefix = if daemon_mode {
+            "chaz-daemon"
+        } else {
+            match (args.print, cmd_args.is_some()) {
+                (_, true) => "chaz-cmd",
+                (true, _) => "chaz-cli",
+                _ => "chaz-tui",
+            }
         };
         let appender = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
@@ -476,11 +480,13 @@ async fn main() -> anyhow::Result<()> {
             .with_writer(non_blocking)
             .with_ansi(false)
             .init();
-        eprintln!(
-            "chaz logs: {}/{}.log (daily, keeps 7 days)",
-            log_dir.display(),
-            prefix,
-        );
+        if !daemon_mode {
+            eprintln!(
+                "chaz logs: {}/{}.log (daily, keeps 7 days)",
+                log_dir.display(),
+                prefix,
+            );
+        }
         Some(guard)
     };
 
@@ -598,20 +604,15 @@ async fn main() -> anyhow::Result<()> {
             run_routine_engine: daemon_mode,
             // The daemon is the sole owner that may mint peer-owned DBs.
             bootstrap_agents_from_config: daemon_mode,
-            // TUI/print retain their local runtime over the connected
-            // Instance; cmd never runs a billable turn. The daemon handles
-            // its own registered sessions (including transport bridges).
-            run_agent_loop: daemon_mode || cmd_args.is_none(),
+            // The daemon is the only local runtime owner. Frontends are
+            // transports over the connected Instance: they create/open
+            // sessions, write input, render output, and relay approvals.
+            run_agent_loop: daemon_mode,
             extra_auto_approved_tools,
-            // `--print` runs exactly one turn, so its tool list has to be
-            // complete before that turn starts. Long-lived modes take the
-            // tools whenever they land. `chaz cmd` runs no turn at all and
-            // so never reaches the gate either way.
-            mcp_readiness: if args.print {
-                server::McpReadiness::AwaitReady
-            } else {
-                server::McpReadiness::Deferred
-            },
+            // Only the daemon runs a turn, so frontend startup never waits
+            // for its own MCP registry. The daemon's long-lived registry
+            // settles independently before it executes a tool-bearing turn.
+            mcp_readiness: server::McpReadiness::Deferred,
         },
     )
     .await?;

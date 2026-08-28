@@ -54,6 +54,11 @@ pub struct SessionRegistry {
     pub agents: Arc<AgentRegistry>,
     pub(super) new_session_tx: mpsc::Sender<NewSessionEvent>,
     new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
+    /// Sessions created by a local service client may predate the daemon's
+    /// in-memory per-DB key mapping. Keep the already-keyed daemon handle so
+    /// all later opens use the same signing identity without weakening the
+    /// general user-key lookup path.
+    local_frontend_sessions: Mutex<std::collections::HashMap<String, Database>>,
     /// Per-`(transport, login_id, channel)` locks serializing get-or-create in
     /// [`super::transport`], so two concurrent inbound messages on a brand-new
     /// channel can't both miss the registry walk and both create a session.
@@ -221,6 +226,7 @@ impl SessionRegistry {
             agents,
             new_session_tx,
             new_session_rx: Mutex::new(Some(new_session_rx)),
+            local_frontend_sessions: Mutex::new(std::collections::HashMap::new()),
             channel_create_locks: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -239,8 +245,20 @@ impl SessionRegistry {
     }
 
     /// Take the new-session event receiver. Can only be called once.
+    ///
+    /// Replays the durable session index into the receiver before returning so
+    /// sessions committed by service clients during daemon startup cannot be
+    /// lost between the registry callback installation and watcher polling.
     pub async fn subscribe_new_sessions(&self) -> Option<mpsc::Receiver<NewSessionEvent>> {
-        self.new_session_rx.lock().await.take()
+        let receiver = self.new_session_rx.lock().await.take()?;
+        let sessions = self.list_sessions().await.unwrap_or_default();
+        for session in sessions {
+            let _ = self.new_session_tx.try_send(NewSessionEvent {
+                session_db_id: session.session_db_id,
+                source: session.source,
+            });
+        }
+        Some(receiver)
     }
 
     /// Group-level routing/metadata DB. Holds session/channel/name indices
@@ -381,8 +399,42 @@ impl SessionRegistry {
     ) -> anyhow::Result<(ConversationId, Database)> {
         let root_id = eidetica::entry::ID::parse(session_db_id)
             .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
+        if let Some(db) = self
+            .local_frontend_sessions
+            .lock()
+            .await
+            .get(session_db_id)
+            .cloned()
+        {
+            return Ok((ConversationId(session_db_id.to_string()), db));
+        }
         let user = self.user.lock().await;
         let db = user.open_database(&root_id).await?;
+        Ok((ConversationId(session_db_id.to_string()), db))
+    }
+
+    /// Open a session created by a local frontend through this daemon's
+    /// service connection. Such sessions use the user's default key, which
+    /// the daemon already holds, but the daemon's in-memory `UserKeyManager`
+    /// does not observe the client's newly-written per-DB mapping. Bind the
+    /// known default signing key directly instead of requiring that stale
+    /// client-local mapping.
+    pub async fn open_local_frontend_session(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        let root_id = eidetica::entry::ID::parse(session_db_id)
+            .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
+        let user = self.user.lock().await;
+        let default_key = user.get_default_key()?;
+        let signing_key = user.get_signing_key(&default_key)?;
+        let db = eidetica::Database::open(&self.instance, &root_id)
+            .await?
+            .with_key(signing_key);
+        self.local_frontend_sessions
+            .lock()
+            .await
+            .insert(session_db_id.to_string(), db.clone());
         Ok((ConversationId(session_db_id.to_string()), db))
     }
 
@@ -705,6 +757,28 @@ mod tests {
             Some(eidetica::crdt::doc::Value::Doc(d)) => DelegatedTreeRef::try_from(d).ok(),
             _ => None,
         }
+    }
+
+    #[tokio::test]
+    async fn subscribe_replays_sessions_created_before_the_receiver_is_taken() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, db) = registry.create_session(Some("cli")).await.unwrap();
+        let expected = db.root_id().to_string();
+
+        // Simulate an event sent before the daemon watcher starts by draining
+        // the original notification. The durable replay must put it back.
+        {
+            let mut receiver = registry.new_session_rx.lock().await;
+            let receiver = receiver.as_mut().unwrap();
+            assert_eq!(receiver.recv().await.unwrap().session_db_id, expected);
+        }
+        let mut receiver = registry.subscribe_new_sessions().await.unwrap();
+        let replayed = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("durable session replay should not wait")
+            .expect("session replay channel should remain open");
+        assert_eq!(replayed.session_db_id, expected);
+        assert_eq!(replayed.source.as_deref(), Some("cli"));
     }
 
     #[tokio::test]

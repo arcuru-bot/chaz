@@ -107,7 +107,11 @@ impl DaemonSpawn for SpawnChazDaemon {
             .arg("daemon")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            // Detached daemons have no terminal, so line-buffered stdout can
+            // otherwise stay invisible until process exit. This is also a
+            // useful opt-in diagnostic for integration harnesses.
+            .env("CHAZ_DAEMON_DETACHED", "1");
         // SAFETY: this hook calls only async-signal-safe `setsid(2)` between
         // fork and exec. A separate session keeps a daemon launched by a
         // one-shot frontend alive after the frontend's process group exits.

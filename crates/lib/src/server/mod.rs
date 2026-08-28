@@ -418,6 +418,9 @@ pub struct Server {
     /// (a [`LocalRuntimeLease`]); the seam a daemon-arbitrated eidetica lease
     /// drops into later. See `server::runtime_lease`.
     runtime_lease: Arc<dyn RuntimeLease>,
+    /// Whether this server is the daemon/runtime process. Frontend and bridge
+    /// servers do not adopt newly indexed sessions.
+    run_agent_loop: bool,
     /// Default runtime-ownership mode applied by [`Server::register_session`]
     /// (the back-compat wrapper). Set once at startup from `config.runtime`
     /// via [`Server::set_runtime_mode`]; a dumb bridge runs `Never`. Defaults
@@ -484,6 +487,7 @@ impl Server {
             startup_ready_flag: Arc::new(AtomicBool::new(true)),
             startup_ready_notify: Arc::new(tokio::sync::Notify::new()),
             runtime_lease: Arc::new(LocalRuntimeLease::new()),
+            run_agent_loop,
             runtime_mode: std::sync::RwLock::new(RuntimeMode::Auto),
         });
 
@@ -500,11 +504,6 @@ impl Server {
                 server_clone.processing_loop(notify_rx).await;
             });
         }
-
-        let server_clone = server.clone();
-        tokio::spawn(async move {
-            server_clone.new_session_watcher().await;
-        });
 
         server
     }
@@ -639,11 +638,17 @@ impl Server {
     /// Set the default runtime-ownership mode used by the back-compat
     /// [`Server::register_session`] wrapper. Called once at startup from
     /// `config.runtime` (a dumb bridge passes [`RuntimeMode::Never`]).
-    pub fn set_runtime_mode(&self, mode: RuntimeMode) {
+    pub fn set_runtime_mode(self: &Arc<Self>, mode: RuntimeMode) {
         *self
             .runtime_mode
             .write()
             .expect("runtime_mode lock poisoned") = mode;
+        if self.run_agent_loop {
+            let server = self.clone();
+            tokio::spawn(async move {
+                server.new_session_watcher().await;
+            });
+        }
     }
 
     /// The default runtime-ownership mode for this peer.
@@ -658,6 +663,18 @@ impl Server {
     /// Test/observability accessor over the in-process lease.
     pub fn runtime_owner_of(&self, session_db_id: &str) -> Option<OwnerId> {
         self.runtime_lease.owner_of(session_db_id)
+    }
+
+    /// Register a local frontend as a transport for `session_db` without
+    /// claiming runtime ownership. The daemon's registry watcher observes the
+    /// session through `chaz_group`, opens it with the user-held session key,
+    /// and becomes the only process allowed to run the agent.
+    pub async fn watch_frontend_session(
+        &self,
+        session_db: &eidetica::Database,
+        backend: BackendManager,
+    ) -> anyhow::Result<()> {
+        self.watch_session(session_db, backend, None, None).await
     }
 
     /// The per-process MCP server directory. Populated by
@@ -1754,17 +1771,18 @@ impl Server {
         }
     }
 
-    /// Watch for new sessions appearing in the registry (local creates, sync, etc.)
-    /// and log them. Bridges are responsible for calling `register_session` to
-    /// wire up agent processing and response delivery for their channels.
+    /// Watch for sessions appearing in this peer's user-central registry.
     ///
-    /// Log-only for now. This is the future `claim_runtime` driver: once an
-    /// auto-claiming daemon (Track D) watches registry-surfaced sessions, it
-    /// will call `watch_session` + `claim_runtime(RuntimeMode::Auto)` here so a
-    /// session exposed by a dumb bridge gets its runtime owner without a
-    /// per-bridge wiring path. Left log-only until the multi-process lease
-    /// lands.
+    /// Local frontends create their session through the service connection,
+    /// which updates the same `chaz_group` tree this daemon has open. The
+    /// daemon already holds the corresponding session key in its `User`; it
+    /// can therefore open, watch, and claim the session directly without a
+    /// cross-process lease or key transfer. Transport bridges still use the
+    /// agent-registry/sync adoption path in `server::build`.
     async fn new_session_watcher(&self) {
+        if !self.run_agent_loop {
+            return;
+        }
         let Some(mut rx) = self.registry.subscribe_new_sessions().await else {
             return;
         };
@@ -1785,6 +1803,65 @@ impl Server {
                 source = ?event.source,
                 "New session detected"
             );
+            let mut opened = self
+                .registry
+                .open_local_frontend_session(&event.session_db_id)
+                .await;
+            if opened.is_err() {
+                // The user-key mapping lives in the user's private tree and
+                // arrives over the service callback separately from the
+                // chaz_group event. Give that write a short bounded window to
+                // become visible before classifying this as a bridge-owned
+                // session that needs the sync adoption path.
+                for _ in 0..20 {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    opened = self
+                        .registry
+                        .open_local_frontend_session(&event.session_db_id)
+                        .await;
+                    if opened.is_ok() {
+                        break;
+                    }
+                }
+            }
+            let Ok((_conversation_id, session_db)) = opened else {
+                debug!(
+                    session_db_id = %event.session_db_id,
+                    "New session is not openable on this peer; leaving it to the bridge adoption path"
+                );
+                continue;
+            };
+            let claimed = match self
+                .claim_runtime(&session_db, "agent".to_string(), 0, RuntimeMode::Auto)
+                .await
+            {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    error!(
+                        session_db_id = %event.session_db_id,
+                        "Failed to claim daemon runtime for new session: {e}"
+                    );
+                    continue;
+                }
+            };
+            if !claimed {
+                continue;
+            }
+            if let Err(e) = self
+                .watch_session(&session_db, self.default_backend.clone(), None, None)
+                .await
+            {
+                self.runtime_lease.release(&event.session_db_id);
+                error!(
+                    session_db_id = %event.session_db_id,
+                    "Failed to watch newly claimed session: {e}"
+                );
+            } else {
+                info!(
+                    session_db_id = %event.session_db_id,
+                    "Daemon registered local frontend session"
+                );
+            }
         }
     }
 

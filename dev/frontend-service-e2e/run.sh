@@ -143,8 +143,27 @@ if [[ $CLEANUP_REGRESSION == 1 ]]; then
 	fail "forced post-autostart failure"
 fi
 
-# `--print` exercises the callback-driven frontend path against the daemon's
-# Instance. A subsequent command reads the same named session.
+# `--print` exercises the transport-only frontend path against the daemon's
+# runtime. Two frontend processes watch the same named session while one user
+# message lands; only the daemon may turn that write into a model request.
+REQUESTS_BEFORE="$(grep -c '^stub_llm: request:' "$WORKSPACE/stub-llm.stdout" || true)"
+"$CHAZ_BIN" --config "$CONFIG" --print --session duplicate-turn hello \
+	>"$WORKSPACE/print-a.out" 2>"$WORKSPACE/print-a.err" &
+PRINT_A_PID="$!"
+wait_for "first print frontend session" 30 sh -c \
+	"grep -q 'source=Some(\"duplicate-turn\")' '$STATE'/chaz-daemon.*.log"
+"$CHAZ_BIN" --config "$CONFIG" --print --session duplicate-turn world \
+	>"$WORKSPACE/print-b.out" 2>"$WORKSPACE/print-b.err" &
+PRINT_B_PID="$!"
+wait "$PRINT_A_PID" || fail "first concurrent print frontend failed"
+wait "$PRINT_B_PID" || fail "second concurrent print frontend failed"
+grep -q 'stub' "$WORKSPACE/print-a.out" || fail "first print frontend returned an unexpected response"
+grep -q 'stub' "$WORKSPACE/print-b.out" || fail "second print frontend returned an unexpected response"
+REQUESTS_AFTER="$(grep -c '^stub_llm: request:' "$WORKSPACE/stub-llm.stdout" || true)"
+[[ $((REQUESTS_AFTER - REQUESTS_BEFORE)) -eq 1 ]] ||
+	fail "two concurrent frontends produced $((REQUESTS_AFTER - REQUESTS_BEFORE)) model turns instead of one coalesced daemon turn"
+
+# A subsequent command reads the same named session.
 PRINT_OUT="$("$CHAZ_BIN" --config "$CONFIG" --print --session print-shared hello \
 	2>"$WORKSPACE/print.err")" || fail "print frontend failed"
 [[ $PRINT_OUT == *"stub"* ]] || fail "print frontend returned an unexpected response"
@@ -250,6 +269,7 @@ wait_for "service-disabled daemon shutdown" 30 sh -c "! kill -0 $DISABLED_DAEMON
 DISABLED_DAEMON_PID=""
 
 printf 'PASS — 8 concurrent frontends converged on one detached daemon\n'
+printf 'PASS — concurrent --print clients left all model turns daemon-owned\n'
 printf 'PASS — --print completed a real callback-driven turn over the service\n'
 printf 'PASS — command and usage clients had bidirectional state visibility\n'
 printf 'PASS — clients read the hosted agent and memory bank indices over the service\n'

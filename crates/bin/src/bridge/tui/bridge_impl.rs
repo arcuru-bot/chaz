@@ -421,13 +421,19 @@ impl Bridge for TuiBridge {
                         }
                     }
                 }
-                Action::ApprovalRequest((id, exchange)) => {
-                    if let Some(idx) = app.tab_index_for(&id) {
-                        app.tabs[idx].pending_approval = Some(exchange);
+                Action::ApprovalRequest(tagged) => {
+                    if let Some(idx) = app.tab_index_for(&tagged.session_db_id) {
+                        tracing::debug!(
+                            request_id = %tagged.request_id,
+                            session_db_id = %tagged.session_db_id,
+                            "Showing daemon approval request in local frontend"
+                        );
+                        app.tabs[idx].pending_approval = Some(tagged.exchange);
                     } else {
                         // Tab was closed but an approval snuck through — deny
-                        // so the runtime doesn't hang waiting.
-                        let _ = exchange
+                        // so the daemon's runtime does not wait out the ceiling.
+                        let _ = tagged
+                            .exchange
                             .decision_tx
                             .send(chaz_core::bridge::ApprovalDecision::Deny);
                     }
