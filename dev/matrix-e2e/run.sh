@@ -117,7 +117,17 @@ cleanup() {
 			kill -0 "$pid" 2>/dev/null || break
 			sleep 0.1
 		done
-		kill -KILL "$pid" 2>/dev/null || true
+		if kill -0 "$pid" 2>/dev/null; then
+			kill -KILL "$pid" 2>/dev/null || true
+			for _ in $(seq 1 50); do
+				kill -0 "$pid" 2>/dev/null || break
+				sleep 0.1
+			done
+		fi
+		if kill -0 "$pid" 2>/dev/null; then
+			printf 'cleanup could not stop pid %s\n' "$pid" >&2
+			status=1
+		fi
 	done
 	if [[ $KEEP -eq 1 ]]; then
 		log "workspace kept at $WORKSPACE"
@@ -186,6 +196,27 @@ retire_pid() {
 			unset 'PIDS[i]'
 		fi
 	done
+}
+
+daemon_pid_for_socket() {
+	ss -xlpn | awk -v socket="$WORKSPACE/state-daemon/eidetica.sock" '
+		index($0, socket) && match($0, /pid=[0-9]+/) { pid = substr($0, RSTART + 4, RLENGTH - 4) }
+		END { print pid }
+	'
+}
+
+adopt_daemon() {
+	local deadline=$((SECONDS + 90))
+	while ((SECONDS < deadline)); do
+		DAEMON_PID="$(daemon_pid_for_socket)"
+		[[ -n $DAEMON_PID ]] && {
+			PIDS+=("$DAEMON_PID")
+			return 0
+		}
+		sleep 0.5
+	done
+	DAEMON_PID=""
+	return 1
 }
 
 SERVER_NAME="e2e.test"
@@ -330,6 +361,8 @@ BRIDGE_CONFIG="$WORKSPACE/bridge.yaml"
 cat >"$DAEMON_CONFIG" <<EOF
 state_dir: "$WORKSPACE/state-daemon"
 $SYNC_LISTEN_DAEMON
+service:
+  enabled: true
 
 backends:
   - name: stub
@@ -368,8 +401,20 @@ BRIDGE_KEY="$("$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" --print-pubkey 2>>"$W
 log "bridge key: $BRIDGE_KEY"
 
 log "pre-authorizing the bridge on the daemon"
+invite_status=0
 "$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd "/agent invite chaz $BRIDGE_KEY write" \
-	>>"$WORKSPACE/bringup.log" 2>&1 || fail "/agent invite failed (see $WORKSPACE/bringup.log)"
+	>>"$WORKSPACE/bringup.log" 2>&1 || invite_status=$?
+# A command can fail after it has started the detached daemon. Wait to adopt it
+# in either case so the EXIT trap owns it before the command error is reported.
+if ! adopt_daemon; then
+	if ((invite_status != 0)); then
+		fail "/agent invite failed (see $WORKSPACE/bringup.log)"
+	fi
+	fail "service-mode bring-up left no daemon owning the socket"
+fi
+if ((invite_status != 0)); then
+	fail "/agent invite failed (see $WORKSPACE/bringup.log)"
+fi
 
 log "minting the access ticket"
 TICKET="$("$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd '/agent share chaz' 2>>"$WORKSPACE/bringup.log" |
@@ -430,10 +475,12 @@ agents:
 EOF
 
 # ------------------------------------------------------------- processes -----
-log "starting daemon"
-spawn daemon "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
-DAEMON_PID="$SPAWNED_PID"
-wait_for "daemon" 90 grep -q "daemon ready" "$WORKSPACE/daemon.log"
+# `chaz cmd` above started the daemon through the same service-client path the
+# local frontends use in production. It is already in PIDS, before the ticket
+# assertions below can fail.
+[[ -S $WORKSPACE/state-daemon/eidetica.sock ]] ||
+	fail "service-mode bring-up removed the daemon socket"
+printf 'auto-started daemon pid=%s; service socket ready\n' "$DAEMON_PID" >"$WORKSPACE/daemon.log"
 
 # The bridge's own crate runs at debug so its message-routing decisions are
 # visible; everything else stays at info. A case about a message that must be

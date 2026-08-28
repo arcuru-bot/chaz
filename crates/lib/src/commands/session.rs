@@ -330,10 +330,6 @@ pub(super) async fn clear_session_name(ctx: &CommandContext<'_>) -> CommandOutco
 }
 
 pub(super) async fn share(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let instance = ctx.server.registry().instance();
-    if instance.sync().is_none() {
-        return CommandOutcome::Error("Sync not enabled".to_string());
-    }
     let db_id = ctx.session_db.root_id().clone();
     let ticket = match ctx.server.registry().share_for(&db_id).await {
         Ok(t) => t,

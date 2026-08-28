@@ -154,8 +154,98 @@ struct SpawnContext {
     /// fresh top-level run (the task builder allocates one).
     iteration_budget: Option<Arc<AtomicU32>>,
     completion_tx: Option<mpsc::Sender<()>>,
-    /// Per-session processing lock — cleared when the task completes
-    processing: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Per-session turn state. The completing task releases its active slot
+    /// and wakes a queued durable message, if one arrived after its context
+    /// snapshot.
+    processing: Arc<Mutex<ProcessingState>>,
+    notify_tx: mpsc::Sender<String>,
+}
+
+/// Per-session turn state.
+///
+/// `active` maps a session to the number of entries the running turn's
+/// context covers — its high-water mark, taken from the snapshot the turn was
+/// built on. `pending` records a processable durable write that arrived
+/// *beyond* that mark, so it is consumed by the next turn even though the
+/// just-completed agent reply is now the latest entry.
+///
+/// The high-water mark is what keeps the wake honest. Every write on a
+/// watched session fires the callback, including the turn's own ack and
+/// reply, and a callback that re-read only the latest entry could still see
+/// the user message the running turn is already answering. Recording it as
+/// pending on that basis re-runs the same turn: a second model call and a
+/// second reply into the room. Comparing against the mark distinguishes "the
+/// message this turn is answering" from "a message that arrived after it
+/// captured context", which is the only one that needs another turn.
+#[derive(Default)]
+struct ProcessingState {
+    active: std::collections::HashMap<String, usize>,
+    pending: std::collections::HashSet<String>,
+}
+
+/// Whether `entries` holds a turn-worthy entry at or beyond `covered` — a
+/// `Directive`, or a `Message` from a sender that is not a known agent.
+/// Mirrors the wake gate in [`Server::process_session`].
+fn has_processable_entry_beyond(
+    entries: &[crate::session::SessionEntry],
+    covered: usize,
+    is_agent: impl Fn(&str) -> bool,
+) -> bool {
+    entries.iter().skip(covered).any(|entry| {
+        matches!(entry.entry_type, EntryType::Directive)
+            || (entry.entry_type == EntryType::Message && !is_agent(&entry.sender))
+    })
+}
+
+#[cfg(test)]
+mod processing_state_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn entry(sender: &str, entry_type: EntryType) -> crate::session::SessionEntry {
+        crate::session::SessionEntry {
+            sender: sender.to_string(),
+            content: String::new(),
+            timestamp: Utc::now(),
+            entry_type,
+            metadata: None,
+            routing: None,
+        }
+    }
+
+    #[test]
+    fn pending_gate_ignores_the_message_already_covered_by_the_active_turn() {
+        let entries = [entry("user", EntryType::Message)];
+        assert!(!has_processable_entry_beyond(&entries, 1, |_| false));
+    }
+
+    #[test]
+    fn pending_gate_accepts_a_later_user_message_but_not_an_agent_reply() {
+        let entries = [
+            entry("user", EntryType::Message),
+            entry("alpha", EntryType::Message),
+            entry("user", EntryType::Message),
+        ];
+        assert!(has_processable_entry_beyond(&entries, 1, |name| name == "alpha"));
+        assert!(!has_processable_entry_beyond(&entries[..2], 1, |name| name == "alpha"));
+    }
+}
+
+/// Release a session's turn slot and re-wake the processing loop when a
+/// durable message arrived after that turn captured its context.
+async fn release_processing_slot(
+    processing: &Mutex<ProcessingState>,
+    notify_tx: &mpsc::Sender<String>,
+    session_db_id: &str,
+) {
+    let wake_pending = {
+        let mut state = processing.lock().await;
+        state.active.remove(session_db_id);
+        state.pending.contains(session_db_id)
+    };
+    if wake_pending {
+        let _ = notify_tx.send(session_db_id.to_string()).await;
+    }
 }
 
 /// Built-in default for the agent→agent burst budget — the run of
@@ -346,7 +436,10 @@ pub struct Server {
     /// Track which session DBs have server callbacks registered
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sessions currently being processed (prevents concurrent agent runs per session)
-    processing: Arc<Mutex<std::collections::HashSet<String>>>,
+    processing: Arc<Mutex<ProcessingState>>,
+    /// Signals tests when an active session records a durable follow-up turn.
+    #[cfg(test)]
+    pending_notify: Arc<tokio::sync::Notify>,
     /// Home-peer gate skip counter keyed by `(session_db_id, agent_name)`.
     /// In-memory, peer-local. Incremented on every wake that the gate
     /// suppresses; cleared when a turn actually runs (home == self) or on
@@ -418,6 +511,9 @@ pub struct Server {
     /// (a [`LocalRuntimeLease`]); the seam a daemon-arbitrated eidetica lease
     /// drops into later. See `server::runtime_lease`.
     runtime_lease: Arc<dyn RuntimeLease>,
+    /// Whether this server is the daemon/runtime process. Frontend and bridge
+    /// servers do not adopt newly indexed sessions.
+    run_agent_loop: bool,
     /// Default runtime-ownership mode applied by [`Server::register_session`]
     /// (the back-compat wrapper). Set once at startup from `config.runtime`
     /// via [`Server::set_runtime_mode`]; a dumb bridge runs `Never`. Defaults
@@ -465,7 +561,9 @@ impl Server {
             prompt_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            processing: Arc::new(Mutex::new(ProcessingState::default())),
+            #[cfg(test)]
+            pending_notify: Arc::new(tokio::sync::Notify::new()),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
             notify_tx,
@@ -484,6 +582,7 @@ impl Server {
             startup_ready_flag: Arc::new(AtomicBool::new(true)),
             startup_ready_notify: Arc::new(tokio::sync::Notify::new()),
             runtime_lease: Arc::new(LocalRuntimeLease::new()),
+            run_agent_loop,
             runtime_mode: std::sync::RwLock::new(RuntimeMode::Auto),
         });
 
@@ -500,11 +599,6 @@ impl Server {
                 server_clone.processing_loop(notify_rx).await;
             });
         }
-
-        let server_clone = server.clone();
-        tokio::spawn(async move {
-            server_clone.new_session_watcher().await;
-        });
 
         server
     }
@@ -639,11 +733,17 @@ impl Server {
     /// Set the default runtime-ownership mode used by the back-compat
     /// [`Server::register_session`] wrapper. Called once at startup from
     /// `config.runtime` (a dumb bridge passes [`RuntimeMode::Never`]).
-    pub fn set_runtime_mode(&self, mode: RuntimeMode) {
+    pub fn set_runtime_mode(self: &Arc<Self>, mode: RuntimeMode) {
         *self
             .runtime_mode
             .write()
             .expect("runtime_mode lock poisoned") = mode;
+        if self.run_agent_loop {
+            let server = self.clone();
+            tokio::spawn(async move {
+                server.new_session_watcher().await;
+            });
+        }
     }
 
     /// The default runtime-ownership mode for this peer.
@@ -658,6 +758,18 @@ impl Server {
     /// Test/observability accessor over the in-process lease.
     pub fn runtime_owner_of(&self, session_db_id: &str) -> Option<OwnerId> {
         self.runtime_lease.owner_of(session_db_id)
+    }
+
+    /// Register a local frontend as a transport for `session_db` without
+    /// claiming runtime ownership. The daemon's registry watcher observes the
+    /// session through `chaz_group`, opens it with the user-held session key,
+    /// and becomes the only process allowed to run the agent.
+    pub async fn watch_frontend_session(
+        &self,
+        session_db: &eidetica::Database,
+        backend: BackendManager,
+    ) -> anyhow::Result<()> {
+        self.watch_session(session_db, backend, None, None).await
     }
 
     /// The per-process MCP server directory. Populated by
@@ -835,6 +947,36 @@ impl Server {
             .get(&(session_db_id.to_string(), agent_name.to_string()))
             .copied()
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    async fn processing_contains(&self, session_db_id: &str) -> bool {
+        self.processing
+            .lock()
+            .await
+            .active
+            .contains_key(session_db_id)
+    }
+
+    #[cfg(test)]
+    async fn await_processing_pending_for_test(&self, session_db_id: &str) {
+        loop {
+            let notified = self.pending_notify.notified();
+            if self.processing.lock().await.pending.contains(session_db_id) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn insert_processing_for_test(&self, session_db_id: String) {
+        self.processing.lock().await.active.insert(session_db_id, 0);
+    }
+
+    #[cfg(test)]
+    async fn remove_processing_for_test(&self, session_db_id: &str) {
+        self.processing.lock().await.active.remove(session_db_id);
     }
 
     /// Override the agent→agent burst budget. Called once at startup
@@ -1463,8 +1605,12 @@ impl Server {
 
         let tx = self.notify_tx.clone();
         let sid = session_db_id.clone();
+        let processing = self.processing.clone();
+        let agents = self.agents.clone();
+        #[cfg(test)]
+        let pending_notify = self.pending_notify.clone();
         session_db
-            .on_write(move |event, _db| {
+            .on_write(move |event, db| {
                 // Deliberately not gated on the source. A co-owner pushing
                 // into a shared session arrives as `Remote`, and that has to
                 // wake the agent here exactly as a local commit does — that
@@ -1474,7 +1620,30 @@ impl Server {
                 debug!(session_db_id = %sid, source = ?event.source(), "Session write; waking the processing loop");
                 let tx = tx.clone();
                 let sid = sid.clone();
+                let processing = processing.clone();
+                let agents = agents.clone();
+                #[cfg(test)]
+                let pending_notify = pending_notify.clone();
+                let db = db.clone();
                 Box::pin(async move {
+                    // A human write can arrive after the active task has
+                    // assembled its context. Remember it before merely
+                    // waking the loop: by the time the wake is consumed, the
+                    // agent reply may be the latest entry and otherwise hides
+                    // this durable message from the normal latest-entry gate.
+                    let session = Session::new(ConversationId(sid.clone()), db).await;
+                    {
+                        let mut state = processing.lock().await;
+                        if let Some(&covered) = state.active.get(&sid)
+                            && has_processable_entry_beyond(session.entries(), covered, |name| {
+                                agents.get(name).is_some()
+                            })
+                        {
+                            state.pending.insert(sid.clone());
+                            #[cfg(test)]
+                            pending_notify.notify_one();
+                        }
+                    }
                     let _ = tx.send(sid).await;
                     Ok(())
                 })
@@ -1648,15 +1817,39 @@ impl Server {
 
             let tx = self.notify_tx.clone();
             let sid = session_db_id.clone();
+            let processing = self.processing.clone();
+            let agents = self.agents.clone();
+            #[cfg(test)]
+            let pending_notify = self.pending_notify.clone();
             session_db
-                .on_write(move |event, _db| {
+                .on_write(move |event, db| {
                     // Source-agnostic for the same reason as `watch_session`:
                     // a spawned child can be co-owned too, and a peer's write
                     // into it has to advance the run.
                     debug!(session_db_id = %sid, source = ?event.source(), "Child session write; waking the processing loop");
                     let tx = tx.clone();
                     let sid = sid.clone();
+                    let processing = processing.clone();
+                    let agents = agents.clone();
+                    #[cfg(test)]
+                    let pending_notify = pending_notify.clone();
+                    let db = db.clone();
                     Box::pin(async move {
+                        let session = Session::new(ConversationId(sid.clone()), db).await;
+                        {
+                            let mut state = processing.lock().await;
+                            if let Some(&covered) = state.active.get(&sid)
+                                && has_processable_entry_beyond(
+                                    session.entries(),
+                                    covered,
+                                    |name| agents.get(name).is_some(),
+                                )
+                            {
+                                state.pending.insert(sid.clone());
+                                #[cfg(test)]
+                                pending_notify.notify_one();
+                            }
+                        }
                         let _ = tx.send(sid).await;
                         Ok(())
                     })
@@ -1754,17 +1947,18 @@ impl Server {
         }
     }
 
-    /// Watch for new sessions appearing in the registry (local creates, sync, etc.)
-    /// and log them. Bridges are responsible for calling `register_session` to
-    /// wire up agent processing and response delivery for their channels.
+    /// Watch for sessions appearing in this peer's user-central registry.
     ///
-    /// Log-only for now. This is the future `claim_runtime` driver: once an
-    /// auto-claiming daemon (Track D) watches registry-surfaced sessions, it
-    /// will call `watch_session` + `claim_runtime(RuntimeMode::Auto)` here so a
-    /// session exposed by a dumb bridge gets its runtime owner without a
-    /// per-bridge wiring path. Left log-only until the multi-process lease
-    /// lands.
+    /// Local frontends create their session through the service connection,
+    /// which updates the same `chaz_group` tree this daemon has open. The
+    /// daemon already holds the corresponding session key in its `User`; it
+    /// can therefore open, watch, and claim the session directly without a
+    /// cross-process lease or key transfer. Transport bridges still use the
+    /// agent-registry/sync adoption path in `server::build`.
     async fn new_session_watcher(&self) {
+        if !self.run_agent_loop {
+            return;
+        }
         let Some(mut rx) = self.registry.subscribe_new_sessions().await else {
             return;
         };
@@ -1785,6 +1979,76 @@ impl Server {
                 source = ?event.source,
                 "New session detected"
             );
+            let mut opened = self
+                .registry
+                .open_local_frontend_session(&event.session_db_id)
+                .await;
+            if opened.is_err() {
+                // The user-key mapping lives in the user's private tree and
+                // arrives over the service callback separately from the
+                // chaz_group event. Give that write a short bounded window to
+                // become visible before classifying this as a bridge-owned
+                // session that needs the sync adoption path.
+                for _ in 0..20 {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    opened = self
+                        .registry
+                        .open_local_frontend_session(&event.session_db_id)
+                        .await;
+                    if opened.is_ok() {
+                        break;
+                    }
+                }
+            }
+            let Ok((_conversation_id, session_db)) = opened else {
+                debug!(
+                    session_db_id = %event.session_db_id,
+                    "New session is not openable on this peer; leaving it to the bridge adoption path"
+                );
+                continue;
+            };
+            let claimed = match self
+                .claim_runtime(&session_db, "agent".to_string(), 0, RuntimeMode::Auto)
+                .await
+            {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    error!(
+                        session_db_id = %event.session_db_id,
+                        "Failed to claim daemon runtime for new session: {e}"
+                    );
+                    continue;
+                }
+            };
+            if !claimed {
+                continue;
+            }
+            let approval_tx = approval_proxy::spawn_session_db_approval_proxy(
+                session_db.clone(),
+                "daemon".to_string(),
+                self.approval_timeout(),
+            )
+            .await;
+            if let Err(e) = self
+                .watch_session(
+                    &session_db,
+                    self.default_backend.clone(),
+                    None,
+                    Some(approval_tx),
+                )
+                .await
+            {
+                self.runtime_lease.release(&event.session_db_id);
+                error!(
+                    session_db_id = %event.session_db_id,
+                    "Failed to watch newly claimed session: {e}"
+                );
+            } else {
+                info!(
+                    session_db_id = %event.session_db_id,
+                    "Daemon registered local frontend session"
+                );
+            }
         }
     }
 
@@ -1840,7 +2104,7 @@ impl Server {
             EntryType::Message => agent_to_agent_target.is_some(),
             EntryType::Directive => true,
             _ => false,
-        };
+        } || self.processing.lock().await.pending.contains(session_db_id);
         if !should_process {
             return Ok(());
         }
@@ -1860,9 +2124,16 @@ impl Server {
 
         {
             let mut processing = self.processing.lock().await;
-            if !processing.insert(session_db_id.to_string()) {
+            if processing.active.contains_key(session_db_id) {
                 return Ok(());
             }
+            processing
+                .active
+                .insert(session_db_id.to_string(), session.entries().len());
+            // A completing turn woke us because a user write landed after it
+            // captured context. Consume that durable wake only after we own
+            // the active slot; wakes that find an active turn leave it set.
+            processing.pending.remove(session_db_id);
         }
         let (backend, agent_override, approval_tx, spawn_ctx) = {
             let sessions = self.sessions.lock().await;
@@ -1878,11 +2149,12 @@ impl Server {
                         iteration_budget: m.iteration_budget.clone(),
                         completion_tx: m.completion_tx.clone(),
                         processing: self.processing.clone(),
+                        notify_tx: self.notify_tx.clone(),
                     },
                 ),
                 None => {
                     // Session not registered for processing — clear lock and bail.
-                    self.processing.lock().await.remove(session_db_id);
+                    self.processing.lock().await.active.remove(session_db_id);
                     return Ok(());
                 }
             }
@@ -1922,7 +2194,7 @@ impl Server {
                 agent = %agent.name,
                 "Not home peer for this session/agent; skipping turn"
             );
-            self.processing.lock().await.remove(session_db_id);
+            self.processing.lock().await.active.remove(session_db_id);
             self.record_home_skip(session_db_id, &agent.name).await;
             return Ok(());
         }
@@ -2228,10 +2500,7 @@ impl Server {
             }
             drop(s);
 
-            {
-                let mut proc = spawn.processing.lock().await;
-                proc.remove(&session_db_id);
-            }
+            release_processing_slot(&spawn.processing, &spawn.notify_tx, &session_db_id).await;
 
             if let Some(tx) = spawn.completion_tx {
                 let _ = tx.send(()).await;

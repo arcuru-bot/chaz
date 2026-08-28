@@ -71,6 +71,23 @@ Bridges are transport-specific but the server is transport-agnostic. Adding a ne
 
 **Source**: `crates/bin/src/bridge/` (TUI: `tui/mod.rs`, Matrix: `matrix/mod.rs`, CLI: `cli.rs`)
 
+### Local frontend service boundary
+
+The local TUI, `--print`, `cmd`, and `usage` are clients of the daemon's
+Eidetica Instance. They never open `eidetica.db`: the first frontend on a cold
+state directory starts a detached `chaz daemon` through a filesystem-locked
+single-flight path, waits for the owner-only Unix socket, and connects. The
+daemon remains the sole embedded-backend opener, sync owner, agent runtime, and
+routine owner. Transport bridges remain separate peers with separate backends.
+
+The connected `Instance` preserves the storage API used above the bootstrap
+seam. Frontends never start a sync engine, routine engine, or agent loop. The
+daemon watches and owns every local frontend session. It separately adopts and
+owns eligible sessions exposed by transport bridges. It relays local TUI approval
+requests through the session DB, so a reopened TUI can render an unresolved
+request and return its decision to the daemon; unanswered requests expire at the
+daemon's configured timeout.
+
 ### Server
 
 The callback-driven server watches session databases and spawns agent tasks:

@@ -374,6 +374,21 @@ pub(super) async fn agent_new(
         ));
     }
 
+    if let Err(e) = ctx
+        .server
+        .registry()
+        .publish_hosted_indices(
+            ctx.server.agent_index(),
+            ctx.server.memory_bank_index(),
+            ctx.server.skill_bank_index(),
+        )
+        .await
+    {
+        return CommandOutcome::Error(format!(
+            "Created Living Agent '{name}' but failed to publish the service catalog: {e}"
+        ));
+    }
+
     CommandOutcome::Text(format!(
         "Created Living Agent '{name}' (DB: {db_id}). Attach to a session with /agent add {name}."
     ))
@@ -384,11 +399,6 @@ pub(super) async fn agent_share(agent_ref: &str, ctx: &CommandContext<'_>) -> Co
         Ok(e) => e,
         Err(msg) => return CommandOutcome::Error(msg),
     };
-
-    let instance = ctx.server.registry().instance();
-    if instance.sync().is_none() {
-        return CommandOutcome::Error("Sync not enabled".to_string());
-    }
 
     let ticket = match ctx.server.registry().share_for(&entry.db_id).await {
         Ok(t) => t,
@@ -550,6 +560,21 @@ pub(super) async fn agent_import(
         ));
     }
 
+    if let Err(e) = ctx
+        .server
+        .registry()
+        .publish_hosted_indices(
+            ctx.server.agent_index(),
+            ctx.server.memory_bank_index(),
+            ctx.server.skill_bank_index(),
+        )
+        .await
+    {
+        return CommandOutcome::Error(format!(
+            "Imported agent '{display_name}' but failed to publish the service catalog: {e}"
+        ));
+    }
+
     CommandOutcome::Text(format!(
         "Imported agent '{display_name}' (DB {db_id}). Attach with /agent add {display_name}."
     ))
@@ -599,6 +624,22 @@ pub(super) async fn agent_delete(agent_ref: &str, ctx: &CommandContext<'_>) -> C
 
     ctx.server.agent_index().unregister(&entry.db_id);
     ctx.server.agents().unregister(&entry.display_name);
+
+    if let Err(e) = ctx
+        .server
+        .registry()
+        .publish_hosted_indices(
+            ctx.server.agent_index(),
+            ctx.server.memory_bank_index(),
+            ctx.server.skill_bank_index(),
+        )
+        .await
+    {
+        return CommandOutcome::Error(format!(
+            "Deleted Living Agent '{}' but failed to publish the service catalog: {e}",
+            entry.display_name
+        ));
+    }
 
     // Agent-owned schedules die with the agent DB; there is no session
     // routine sweep. A Pinned schedule whose owner is gone self-skips at

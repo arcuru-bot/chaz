@@ -1254,6 +1254,10 @@ mod tests {
             }),
         };
         let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("cli_auto_approved_tools"),
+            "routing metadata must not carry approval authority: {json}"
+        );
         let back: SessionEntry = serde_json::from_str(&json).unwrap();
         let src = back.routing.unwrap().source.unwrap();
         assert_eq!(src.transport, "matrix");

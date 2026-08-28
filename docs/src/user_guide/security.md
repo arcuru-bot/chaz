@@ -70,7 +70,9 @@ Approval levels:
 
 How you're asked depends on the surface:
 
-- **TUI** — an inline y/n/a prompt.
+- **TUI** — an inline y/n/a prompt. The daemon writes the request into the
+  session DB and waits for the TUI's decision, so closing and reopening the TUI
+  does not lose an unresolved prompt.
 - **Matrix / Discord** — the daemon posts a 🔒 approval prompt into the room/channel; **react** ✅ approve · ❌ deny · ⏭ approve-all, or reply `!chaz approve` / `!chaz deny`. The decision rides back to the daemon over the session DB. This is **fail-closed**: if no one answers in time, or the bridge is down, the tool is **denied**, never run unsupervised. See [Dumb Transport Bridges → Tool approvals over the session DB](../design/transport_bridges.md#tool-approvals-over-the-session-db) for the mechanism.
 
 An unanswered prompt expires after `approvals.timeout` seconds (default 300). The tool does not run, and the room is told which one expired:
@@ -83,6 +85,10 @@ approvals:
 Only the daemon reads this block — it owns the waiting runtime, so it owns the clock, and no bridge keeps one. Every request the daemon posts carries the ceiling, so the prompt can tell you how long you have; on expiry the daemon records the outcome in the session and each bridge renders it to its channel. An expiry is recorded distinctly from a deliberate deny, so a transcript shows whether a call was refused or simply never answered.
 
 An answer that arrives after the expiry does not revive the request. The daemon already told the agent the call was not approved, and the session resolves to that outcome no matter what lands afterwards.
+
+`chaz --print` has no approval surface. `UnlessAutoApproved` tools follow the
+daemon's ordinary `security.auto_approved_tools`; an `Always` tool policy
+requires an approval and therefore fails closed in print mode.
 
 ## Capability Grants
 

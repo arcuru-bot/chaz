@@ -54,6 +54,11 @@ pub struct SessionRegistry {
     pub agents: Arc<AgentRegistry>,
     pub(super) new_session_tx: mpsc::Sender<NewSessionEvent>,
     new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
+    /// Sessions created by a local service client may predate the daemon's
+    /// in-memory per-DB key mapping. Keep the already-keyed daemon handle so
+    /// all later opens use the same signing identity without weakening the
+    /// general user-key lookup path.
+    local_frontend_sessions: Mutex<std::collections::HashMap<String, Database>>,
     /// Per-`(transport, login_id, channel)` locks serializing get-or-create in
     /// [`super::transport`], so two concurrent inbound messages on a brand-new
     /// channel can't both miss the registry walk and both create a session.
@@ -75,8 +80,104 @@ pub(super) const STORE_SESSION_CATALOG: &str = "session_catalog";
 /// `chaz_peer` (per-machine), not the cross-peer `chaz_group`.
 const STORE_PEER_DEFAULTS: &str = "peer_defaults";
 const KEY_DEFAULT_AGENTS: &str = "default_agents";
+const STORE_SERVICE_STATE: &str = "service_state";
+const KEY_SYNC_ADDRESSES: &str = "sync_addresses";
+const KEY_HOSTED_AGENTS: &str = "hosted_agents";
+const KEY_HOSTED_MEMORY_BANKS: &str = "hosted_memory_banks";
+const KEY_HOSTED_SKILL_BANKS: &str = "hosted_skill_banks";
+
+async fn read_hosted_entries(
+    store: &DocStore,
+    key: &str,
+) -> anyhow::Result<Vec<crate::hosted_index::DbEntry>> {
+    match store.get_string(key).await {
+        Ok(raw) => Ok(serde_json::from_str(&raw)?),
+        Err(e) if e.is_not_found() => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
 
 impl SessionRegistry {
+    pub async fn publish_sync_addresses(
+        &self,
+        addresses: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let tx = self.chaz_peer.new_transaction().await?;
+        let store = tx.get_store::<DocStore>(STORE_SERVICE_STATE).await?;
+        store
+            .set_string(KEY_SYNC_ADDRESSES, serde_json::to_string(addresses)?)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn service_sync_addresses(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let store = self
+            .chaz_peer
+            .get_store_viewer::<DocStore>(STORE_SERVICE_STATE)
+            .await?;
+        match store.get_string(KEY_SYNC_ADDRESSES).await {
+            Ok(raw) => Ok(serde_json::from_str(&raw)?),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    pub async fn publish_hosted_entities(
+        &self,
+        agents: &[crate::hosted_index::DbEntry],
+        memory_banks: &[crate::hosted_index::DbEntry],
+        skill_banks: &[crate::hosted_index::DbEntry],
+    ) -> anyhow::Result<()> {
+        let tx = self.chaz_peer.new_transaction().await?;
+        let store = tx.get_store::<DocStore>(STORE_SERVICE_STATE).await?;
+        for (key, entries) in [
+            (KEY_HOSTED_AGENTS, agents),
+            (KEY_HOSTED_MEMORY_BANKS, memory_banks),
+            (KEY_HOSTED_SKILL_BANKS, skill_banks),
+        ] {
+            store
+                .set_string(key, serde_json::to_string(entries)?)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Publish the current hosted-entity indices for service clients to hydrate.
+    ///
+    /// The indices remain the runtime source for lifecycle commands; this only
+    /// refreshes the daemon-owned service snapshot after one changes.
+    pub async fn publish_hosted_indices(
+        &self,
+        agents: &crate::hosted_index::HostedIndex,
+        memory_banks: &crate::hosted_index::HostedIndex,
+        skill_banks: &crate::hosted_index::HostedIndex,
+    ) -> anyhow::Result<()> {
+        let agents = agents.list();
+        let memory_banks = memory_banks.list();
+        let skill_banks = skill_banks.list();
+        self.publish_hosted_entities(&agents, &memory_banks, &skill_banks)
+            .await
+    }
+
+    pub async fn service_hosted_entities(
+        &self,
+    ) -> anyhow::Result<(
+        Vec<crate::hosted_index::DbEntry>,
+        Vec<crate::hosted_index::DbEntry>,
+        Vec<crate::hosted_index::DbEntry>,
+    )> {
+        let store = self
+            .chaz_peer
+            .get_store_viewer::<DocStore>(STORE_SERVICE_STATE)
+            .await?;
+        Ok((
+            read_hosted_entries(&store, KEY_HOSTED_AGENTS).await?,
+            read_hosted_entries(&store, KEY_HOSTED_MEMORY_BANKS).await?,
+            read_hosted_entries(&store, KEY_HOSTED_SKILL_BANKS).await?,
+        ))
+    }
+
     pub async fn new(
         instance: eidetica::Instance,
         mut user: eidetica::user::User,
@@ -125,6 +226,7 @@ impl SessionRegistry {
             agents,
             new_session_tx,
             new_session_rx: Mutex::new(Some(new_session_rx)),
+            local_frontend_sessions: Mutex::new(std::collections::HashMap::new()),
             channel_create_locks: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -143,8 +245,36 @@ impl SessionRegistry {
     }
 
     /// Take the new-session event receiver. Can only be called once.
+    ///
+    /// Replays the durable session index into the receiver before returning so
+    /// sessions committed by service clients during daemon startup cannot be
+    /// lost between the registry callback installation and watcher polling.
     pub async fn subscribe_new_sessions(&self) -> Option<mpsc::Receiver<NewSessionEvent>> {
-        self.new_session_rx.lock().await.take()
+        let receiver = self.new_session_rx.lock().await.take()?;
+        let sessions = self.list_sessions().await.unwrap_or_default();
+        // Do not replay through `try_send`: the shared callback queue has a
+        // deliberately small capacity so callbacks never wait on a slow
+        // consumer. A startup catalog larger than that capacity must still
+        // converge. Sending on a detached task preserves callback
+        // responsiveness while applying backpressure only to this durable,
+        // one-off replay; the consumer's `seen` set dedupes overlap with live
+        // notifications.
+        let tx = self.new_session_tx.clone();
+        tokio::spawn(async move {
+            for session in sessions {
+                if tx
+                    .send(NewSessionEvent {
+                        session_db_id: session.session_db_id,
+                        source: session.source,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Some(receiver)
     }
 
     /// Group-level routing/metadata DB. Holds session/channel/name indices
@@ -285,8 +415,75 @@ impl SessionRegistry {
     ) -> anyhow::Result<(ConversationId, Database)> {
         let root_id = eidetica::entry::ID::parse(session_db_id)
             .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
+        if let Some(db) = self
+            .local_frontend_sessions
+            .lock()
+            .await
+            .get(session_db_id)
+            .cloned()
+        {
+            return Ok((ConversationId(session_db_id.to_string()), db));
+        }
         let user = self.user.lock().await;
         let db = user.open_database(&root_id).await?;
+        Ok((ConversationId(session_db_id.to_string()), db))
+    }
+
+    /// Open a session created by a local frontend through this daemon's
+    /// service connection.
+    ///
+    /// `create_session` signs a local frontend's session with the user's
+    /// default key, which this daemon holds. The daemon's in-memory
+    /// `UserKeyManager` does not observe the client's newly-written per-DB
+    /// mapping, so `User::open_database` — which selects a key from that
+    /// mapping — cannot find one and the ordinary open path fails.
+    ///
+    /// Holding the default key is not on its own a reason to write as it.
+    /// Sessions also arrive from transport bridges, which are separate peers
+    /// that authorize their own keys; the daemon's default key is not a member
+    /// of those trees. Resolve the default key against the session's own
+    /// `_settings` auth and bind the resulting identity, so this path adopts a
+    /// session only when the tree itself grants the key write access. A
+    /// session that resolves to nothing (or to read-only) is left to the
+    /// bridge adoption path in `server::build`, which opens it under the key
+    /// that peer actually holds.
+    ///
+    /// The authority comes from the tree's auth settings, never from session
+    /// content, so a session writer cannot promote itself into this path.
+    pub async fn open_local_frontend_session(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        let root_id = eidetica::entry::ID::parse(session_db_id)
+            .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
+        let user = self.user.lock().await;
+        let default_key = user.get_default_key()?;
+        let (identity, permission) = Database::find_sigkeys(&self.instance, &root_id, &default_key)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Session {session_db_id} does not authorize this peer's default key"
+                )
+            })?;
+        if !permission.can_write() {
+            anyhow::bail!(
+                "Session {session_db_id} grants this peer's default key {permission:?}, \
+                 which cannot run a turn"
+            );
+        }
+        let signing_key = user.get_signing_key(&default_key)?;
+        let db = eidetica::Database::open(&self.instance, &root_id)
+            .await?
+            .with_key(eidetica::database::DatabaseKey::with_identity(
+                signing_key,
+                identity,
+            ));
+        self.local_frontend_sessions
+            .lock()
+            .await
+            .insert(session_db_id.to_string(), db.clone());
         Ok((ConversationId(session_db_id.to_string()), db))
     }
 
@@ -609,6 +806,97 @@ mod tests {
             Some(eidetica::crdt::doc::Value::Doc(d)) => DelegatedTreeRef::try_from(d).ok(),
             _ => None,
         }
+    }
+
+    #[tokio::test]
+    async fn subscribe_replays_sessions_created_before_the_receiver_is_taken() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, db) = registry.create_session(Some("cli")).await.unwrap();
+        let expected = db.root_id().to_string();
+
+        // Simulate an event sent before the daemon watcher starts by draining
+        // the original notification. The durable replay must put it back.
+        {
+            let mut receiver = registry.new_session_rx.lock().await;
+            let receiver = receiver.as_mut().unwrap();
+            assert_eq!(receiver.recv().await.unwrap().session_db_id, expected);
+        }
+        let mut receiver = registry.subscribe_new_sessions().await.unwrap();
+        let replayed = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("durable session replay should not wait")
+            .expect("session replay channel should remain open");
+        assert_eq!(replayed.session_db_id, expected);
+        assert_eq!(replayed.source.as_deref(), Some("cli"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_replays_every_session_beyond_channel_capacity() {
+        let (_instance, registry) = make_registry().await;
+        let mut expected = std::collections::HashSet::new();
+        for index in 0..65 {
+            let (_conv, db) = registry
+                .create_session(Some(&format!("replay-{index}")))
+                .await
+                .unwrap();
+            expected.insert(db.root_id().to_string());
+        }
+
+        // Drain live notifications so this assertion exercises the durable
+        // startup replay rather than the creation path.
+        {
+            let mut receiver = registry.new_session_rx.lock().await;
+            let receiver = receiver.as_mut().unwrap();
+            for _ in 0..64 {
+                receiver.recv().await.unwrap();
+            }
+        }
+        let mut receiver = registry.subscribe_new_sessions().await.unwrap();
+        let mut replayed = std::collections::HashSet::new();
+        while replayed.len() < expected.len() {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("replay should continue past channel capacity")
+                .expect("replay channel should remain open");
+            replayed.insert(event.session_db_id);
+        }
+        assert_eq!(replayed, expected);
+    }
+
+    #[tokio::test]
+    async fn hosted_entities_round_trip_through_peer_service_state() {
+        let (_instance, registry) = make_registry().await;
+        let agent = crate::hosted_index::DbEntry {
+            db_id: registry.chaz_group().root_id().clone(),
+            display_name: "chaz".into(),
+            pubkey: registry
+                .find_key_for_db(registry.chaz_group().root_id())
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        let memory = crate::hosted_index::DbEntry {
+            display_name: "shared-notes".into(),
+            ..agent.clone()
+        };
+        let skill = crate::hosted_index::DbEntry {
+            display_name: "shared-skills".into(),
+            ..agent.clone()
+        };
+
+        registry
+            .publish_hosted_entities(
+                std::slice::from_ref(&agent),
+                std::slice::from_ref(&memory),
+                std::slice::from_ref(&skill),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registry.service_hosted_entities().await.unwrap(),
+            (vec![agent], vec![memory], vec![skill])
+        );
     }
 
     #[tokio::test]

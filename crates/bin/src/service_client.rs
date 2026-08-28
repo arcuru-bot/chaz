@@ -28,6 +28,8 @@
 
 use anyhow::{Context, Result};
 use std::fs::File;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -53,8 +55,12 @@ pub const START_LOCK_FILE: &str = "daemon-start.lock";
 /// existing is not: a daemon that died leaves the file behind, and treating
 /// that as "a daemon is running" is how a frontend ends up waiting forever for
 /// a peer that no longer exists.
-pub fn socket_is_live(path: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(path).is_ok()
+pub async fn socket_is_ready(path: &Path) -> bool {
+    let mode_0600 = tokio::fs::metadata(path)
+        .await
+        .map(|m| m.permissions().mode() & 0o777 == 0o600)
+        .unwrap_or(false);
+    mode_0600 && tokio::net::UnixStream::connect(path).await.is_ok()
 }
 
 /// Starts a daemon. Production spawns the chaz binary; tests substitute
@@ -94,34 +100,60 @@ impl DaemonSpawn for SpawnChazDaemon {
         // "persistent". Its stdio is dropped rather than inherited: a daemon
         // writing into the client's stdout would corrupt output the client
         // reserves for its own result.
-        std::process::Command::new(&self.program)
+        let mut command = std::process::Command::new(&self.program);
+        command
             .arg("--config")
             .arg(&self.config_path)
             .arg("daemon")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "could not start a chaz daemon from {}",
-                    self.program.display()
-                )
-            })?;
+            // Detached daemons have no terminal, so line-buffered stdout can
+            // otherwise stay invisible until process exit. This is also a
+            // useful opt-in diagnostic for integration harnesses.
+            .env("CHAZ_DAEMON_DETACHED", "1");
+        // SAFETY: this hook calls only async-signal-safe `setsid(2)` between
+        // fork and exec. A separate session keeps a daemon launched by a
+        // one-shot frontend alive after the frontend's process group exits.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().with_context(|| {
+            format!(
+                "could not start a chaz daemon from {}",
+                self.program.display()
+            )
+        })?;
         Ok(())
     }
+}
+
+/// Connect one independent client and create a database through it. Used by
+/// the live service test to prove server→client write notifications are not
+/// merely visible after a later poll.
+#[cfg(test)]
+async fn create_named_database(socket: &Path, name: &str) -> Result<()> {
+    let url_path = resolve_socket_url_path(socket)?;
+    let instance = eidetica::Instance::connect(format!("unix://{}", url_path.display())).await?;
+    let mut user = instance.login_user("chaz", None).await?;
+    let key = user.get_default_key()?;
+    let mut settings = eidetica::crdt::Doc::new();
+    settings.set("name", name);
+    user.create_database(settings, &key).await?;
+    Ok(())
 }
 
 /// Resolve the socket path to the absolute form eidetica's `unix://` URL
 /// parser requires.
 ///
-/// The daemon and the client may agree on a *relative* socket path — a bare
-/// `service.path`, or the `eidetica.sock` default when no state directory
-/// resolves — and both bind and probe it against the process working
-/// directory. Eidetica only accepts absolute paths in a `unix://` URL, so the
-/// connection URL must be built from the cwd-resolved form. Everything else —
-/// the stored path, lock paths, liveness probes, stale-socket cleanup — keeps
-/// working with the path as given.
+/// `resolve_service_socket` resolves configured relative paths against the
+/// state directory before constructing an `AutoStart`, so the fallback here is
+/// only for the state-directory-unavailable default socket.
 fn resolve_socket_url_path(socket: &Path) -> Result<PathBuf> {
     if socket.is_absolute() {
         return Ok(socket.to_path_buf());
@@ -161,20 +193,17 @@ impl<S: DaemonSpawn> AutoStart<S> {
 
     /// Override the readiness bound. Mostly for tests, which cannot afford to
     /// wait out the production timeout to prove it exists.
+    #[cfg(test)]
     pub fn with_readiness_timeout(mut self, timeout: Duration) -> Self {
         self.readiness_timeout = timeout;
         self
     }
 
     /// Override the readiness poll interval.
+    #[cfg(test)]
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
-    }
-
-    /// The socket this will connect to.
-    pub fn socket(&self) -> &Path {
-        &self.socket
     }
 
     /// Return once a daemon is serving the socket, starting one if needed.
@@ -182,7 +211,7 @@ impl<S: DaemonSpawn> AutoStart<S> {
     /// Every failure path is an error. None of them opens the backend, because
     /// nothing here can.
     pub async fn ensure_serving(&self) -> Result<()> {
-        if socket_is_live(&self.socket) {
+        if socket_is_ready(&self.socket).await {
             return Ok(());
         }
 
@@ -200,9 +229,31 @@ impl<S: DaemonSpawn> AutoStart<S> {
                 // Won the claim. Re-probe: a daemon may have finished coming up
                 // between the first probe and the claim, in which case starting
                 // a second one would be exactly the bug this prevents.
-                if !socket_is_live(&self.socket) {
-                    self.clear_stale_socket()?;
-                    self.spawn.spawn()?;
+                if !socket_is_ready(&self.socket).await {
+                    match (
+                        self.claim_absent_daemon()?,
+                        socket_is_ready(&self.socket).await,
+                    ) {
+                        (Some(daemon_claim), false) => {
+                            // Taking the daemon claim excludes a daemon from
+                            // binding while stale cleanup runs. It also lets a
+                            // manually started daemon that has bound but not
+                            // chmodded its socket keep ownership: it holds the
+                            // claim, so this branch never unlinks its socket.
+                            self.clear_stale_socket()?;
+                            // The child daemon must hold this claim for its
+                            // lifetime, not its launcher.
+                            drop(daemon_claim);
+                            self.spawn.spawn()?;
+                        }
+                        (None, _) => {
+                            // A daemon owns the state directory and may be in
+                            // the bind-before-chmod window. Wait within the
+                            // normal bound; never unlink its socket or spawn a
+                            // competing backend opener.
+                        }
+                        (Some(_), true) => {}
+                    }
                 }
                 let ready = self.await_ready().await;
                 // Released whether or not it came up: holding a claim over a
@@ -250,11 +301,35 @@ impl<S: DaemonSpawn> AutoStart<S> {
         }
     }
 
+    /// Atomically determine whether a daemon owns this state directory.
+    ///
+    /// A returned claim is held through stale-socket cleanup, so no daemon can
+    /// bind the socket between deciding it is dead and unlinking it. `None`
+    /// means a daemon is alive; callers must wait for it rather than touch its
+    /// socket.
+    fn claim_absent_daemon(&self) -> Result<Option<File>> {
+        let path = self
+            .start_lock
+            .parent()
+            .expect("start lock always has a state-directory parent")
+            .join(DAEMON_LOCK_FILE);
+        let file = File::create(&path)
+            .with_context(|| format!("could not open the daemon claim at {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::new(e).context(format!(
+                "could not inspect the daemon claim at {}",
+                path.display()
+            ))),
+        }
+    }
+
     /// Poll until the socket accepts connections, or the bound expires.
     async fn await_ready(&self) -> Result<()> {
         let deadline = Instant::now() + self.readiness_timeout;
         loop {
-            if socket_is_live(&self.socket) {
+            if socket_is_ready(&self.socket).await {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -313,6 +388,8 @@ mod tests {
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
                 if let Ok(listener) = std::os::unix::net::UnixListener::bind(&socket) {
+                    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
                     listeners.lock().unwrap().push(listener);
                 }
             });
@@ -348,20 +425,54 @@ mod tests {
             .with_poll_interval(Duration::from_millis(5))
     }
 
-    #[test]
-    fn only_a_socket_someone_answers_on_is_live() {
+    async fn start_service() -> (
+        tempfile::TempDir,
+        PathBuf,
+        tokio::sync::watch::Sender<()>,
+        tokio::task::JoinHandle<eidetica::Result<()>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("eidetica.sock");
+        let (instance, _) = eidetica::Instance::create_backend(
+            Box::new(eidetica::backend::database::InMemory::new()),
+            eidetica::NewUser::passwordless("chaz"),
+        )
+        .await
+        .unwrap();
+        let (stop, stopped) = tokio::sync::watch::channel(());
+        let server = eidetica::service::ServiceServer::new(instance, socket.clone());
+        let task = tokio::spawn(async move { server.run(stopped).await });
+        let auto = fast(
+            socket.clone(),
+            dir.path(),
+            NeverReady {
+                starts: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        auto.await_ready().await.unwrap();
+        (dir, socket, stop, task)
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_a_live_owner_only_socket() {
         let dir = tempfile::tempdir().unwrap();
 
-        assert!(!socket_is_live(&dir.path().join("missing.sock")));
+        assert!(!socket_is_ready(&dir.path().join("missing.sock")).await);
 
         // A crash leftover: the path is there, nobody is behind it.
         let stale = dir.path().join("stale.sock");
         std::fs::write(&stale, b"").unwrap();
-        assert!(!socket_is_live(&stale));
+        assert!(!socket_is_ready(&stale).await);
 
         let live = dir.path().join("live.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
-        assert!(socket_is_live(&live));
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !socket_is_ready(&live).await,
+            "a socket accepting connections before chmod must not be ready"
+        );
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(socket_is_ready(&live).await);
     }
 
     #[tokio::test]
@@ -369,6 +480,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("eidetica.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let daemon = FakeDaemon::new(&socket);
         let starts = daemon.starts();
@@ -377,6 +489,69 @@ mod tests {
             .await
             .expect("a live socket needs no daemon");
         assert_eq!(starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_clients_share_writes_and_notifications_bidirectionally() {
+        let (_dir, socket, stop, task) = start_service().await;
+        let auto = fast(
+            socket.clone(),
+            socket.parent().unwrap(),
+            NeverReady {
+                starts: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        let instance_a = auto.connect().await.expect("first live client connects");
+        let mut user_a = instance_a.login_user("chaz", None).await.unwrap();
+        let preferences_a = user_a.user_database().clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        preferences_a
+            .on_write(move |_event, _db| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(()).await;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap()
+            .detach();
+
+        create_named_database(&socket, "from-client-b")
+            .await
+            .expect("second client writes through the service");
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("client A receives the daemon-published notification")
+            .expect("notification channel stays open");
+        let instance_after_b = auto.connect().await.expect("verification client connects");
+        let user_after_b = instance_after_b.login_user("chaz", None).await.unwrap();
+        assert_eq!(
+            user_after_b
+                .find_database("from-client-b")
+                .await
+                .expect("a fresh client sees client B's database")
+                .len(),
+            1
+        );
+
+        let key = user_a.get_default_key().unwrap();
+        let mut settings = eidetica::crdt::Doc::new();
+        settings.set("name", "from-client-a");
+        user_a.create_database(settings, &key).await.unwrap();
+        let instance_b = auto.connect().await.expect("third live client connects");
+        let user_b = instance_b.login_user("chaz", None).await.unwrap();
+        assert_eq!(
+            user_b
+                .find_database("from-client-a")
+                .await
+                .expect("client B sees client A's database")
+                .len(),
+            1
+        );
+
+        drop(stop);
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -391,7 +566,8 @@ mod tests {
         let auto = fast(socket.clone(), dir.path(), daemon);
         auto.ensure_serving().await.expect("daemon should come up");
         assert_eq!(starts.load(Ordering::SeqCst), 1);
-        assert!(socket_is_live(&socket));
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(socket_is_ready(&socket).await);
     }
 
     #[tokio::test]
@@ -408,7 +584,46 @@ mod tests {
             .await
             .expect("a stale socket must not block a start");
         assert_eq!(starts.load(Ordering::SeqCst), 1);
-        assert!(socket_is_live(&socket));
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(socket_is_ready(&socket).await);
+    }
+
+    #[tokio::test]
+    async fn live_daemon_in_bind_before_chmod_window_keeps_its_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("eidetica.sock");
+        let daemon_lock = File::create(dir.path().join(DAEMON_LOCK_FILE)).unwrap();
+        daemon_lock.try_lock().unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let starts = Arc::new(AtomicUsize::new(0));
+        let auto = fast(
+            socket.clone(),
+            dir.path(),
+            NeverReady {
+                starts: Arc::clone(&starts),
+            },
+        );
+        let wait = tokio::spawn(async move { auto.ensure_serving().await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            socket.exists(),
+            "a live daemon's pre-chmod socket was unlinked"
+        );
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            0,
+            "the client must wait for the live daemon instead of starting another"
+        );
+
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        wait.await
+            .unwrap()
+            .expect("the client waits through bind-before-chmod and then connects");
+        drop(listener);
+        drop(daemon_lock);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

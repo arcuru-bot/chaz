@@ -67,8 +67,8 @@ The approval round-trip in step 5 exists because the bridge's key is unknown
 until it first asks. Ask it directly instead, and the whole sequence runs
 unattended — useful for provisioning and required for automated tests.
 
-Run these with both processes stopped: each opens a state directory, and two
-processes on one backend do not observe each other's writes.
+These commands use the daemon's local service socket, so they can run while the
+daemon is serving Matrix sessions.
 
 ```bash
 # 1. The bridge's identity, generated on first call and stable thereafter.

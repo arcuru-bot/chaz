@@ -151,13 +151,20 @@ The bridge normally needs its access request approved by hand. The harness
 avoids that entirely:
 
 1. `chaz-matrix --print-pubkey` reports the key the bridge will authenticate as.
-2. `chaz cmd '/agent invite chaz <key> write'` pre-authorizes it.
-3. `chaz cmd '/agent share chaz'` mints the ticket.
+2. `chaz cmd '/agent invite chaz <key> write'` starts the daemon through the
+   local service socket and pre-authorizes the bridge.
+3. `chaz cmd '/agent share chaz'` connects to that same daemon and mints the
+   ticket.
 
 Pre-authorized access bootstraps straight through, and the harness fails loudly
 if the bridge logs a pending request instead — that would mean the
 pre-authorization silently stopped working, which is exactly the regression this
 sequence exists to protect.
+
+The harness keeps that auto-started daemon for the Matrix scenarios. This makes
+the bounded Matrix run exercise service mode without changing the bridge's
+topology: `chaz-matrix` still owns its own state directory and reaches the agent
+peer through Eidetica sync.
 
 ## Notes
 

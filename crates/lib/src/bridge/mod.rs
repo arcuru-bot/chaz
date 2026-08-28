@@ -17,7 +17,7 @@
 use crate::agent::AgentRegistry;
 use crate::server::Server;
 use crate::session::{EntryRouting, EntryType, Session, SessionEntry, TransportRef};
-use crate::tool::ToolApprovalInfo;
+use crate::tool::{RiskLevel, ToolApprovalInfo};
 use crate::types::ConversationId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -226,6 +226,22 @@ pub fn parse_approval_request(entry: &SessionEntry) -> Option<ApprovalRequestPay
     (entry.entry_type == EntryType::ApprovalRequest)
         .then(|| serde_json::from_str(&entry.content).ok())
         .flatten()
+}
+
+/// Convert a persisted approval request into the in-process shape used by a
+/// local interactive frontend. The daemon remains the runtime owner; the
+/// frontend only renders the request and writes its answer back to the session.
+pub fn approval_info_from_payload(payload: &ApprovalRequestPayload) -> ToolApprovalInfo {
+    let risk_level = match payload.risk_level.as_str() {
+        "Medium" => RiskLevel::Medium,
+        "High" => RiskLevel::High,
+        _ => RiskLevel::Low,
+    };
+    ToolApprovalInfo {
+        name: payload.tool_name.clone(),
+        arguments_display: payload.arguments_display.clone(),
+        risk_level,
+    }
 }
 
 /// Parse an [`EntryType::ApprovalDecision`] entry's payload, or `None`.
@@ -774,6 +790,10 @@ mod tests {
         assert_eq!(parsed.tool_name, "shell");
         assert_eq!(parsed.risk_level, "High");
         assert_eq!(parsed.timeout_secs, 300);
+        let info = approval_info_from_payload(&parsed);
+        assert_eq!(info.name, "shell");
+        assert_eq!(info.arguments_display, "{\"path\":\"/etc\"}");
+        assert_eq!(info.risk_level, crate::tool::RiskLevel::High);
 
         let dec = approval_decision_entry("@human:x", &request_id, ApprovalDecision::ApproveAll);
         assert_eq!(dec.entry_type, EntryType::ApprovalDecision);

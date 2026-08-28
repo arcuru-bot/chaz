@@ -14,7 +14,8 @@ publish = false
 
 [workspace.dependencies]
 # Pinned external sources — kept in sync across both crates.
-eidetica = { git = "https://github.com/arcuru/eidetica", rev = "5d9a657c1df341ecb6ab291dbf8527488356ac52", features = ["sqlite", "service"] }
+# Depends on https://github.com/arcuru/eidetica/pull/108.
+eidetica = { git = "https://github.com/arcuru/eidetica", rev = "5c4260d9e1e6171a821cea98aa6afad1b5a87de0", features = ["sqlite", "service"] }
 
 # Shared third-party deps.
 anyhow = "1"
@@ -33,6 +34,7 @@ lazy_static = "1"
 regex = "1"
 dirs = "5"
 getrandom = "0.3"
+libc = "0.2"
 async-openai = { version = "0.36", default-features = false, features = ["rustls", "byot", "chat-completion"] }
 chrono = { version = "0.4", features = ["serde"] }
 cron = "0.15"

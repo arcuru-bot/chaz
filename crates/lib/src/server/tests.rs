@@ -758,16 +758,18 @@ async fn agent_schedule_processing_lock_skips_busy_session() {
 
     // Manually insert the session into the processing set to simulate
     // a busy session.
-    server.processing.lock().await.insert(session_db_id.clone());
+    server
+        .insert_processing_for_test(session_db_id.clone())
+        .await;
 
     let payload = pinned_schedule_payload(&entry.db_id.to_string(), "t1", "wake", &session_db_id);
     let result = server.fire_agent_schedule(payload).await;
     assert!(result.is_ok(), "busy session should be skipped gracefully");
 
     // The lock should still be held (we inserted it manually).
-    assert!(server.processing.lock().await.contains(&session_db_id));
+    assert!(server.processing_contains(&session_db_id).await);
     // Clean up.
-    server.processing.lock().await.remove(&session_db_id);
+    server.remove_processing_for_test(&session_db_id).await;
 }
 
 #[tokio::test]
@@ -1089,7 +1091,11 @@ fn register_alpha_agent_runtime(server: &Server) {
     });
 }
 
-async fn write_user_message(session_db: &eidetica::Database, sid: &str) {
+async fn write_user_message_with_content(
+    session_db: &eidetica::Database,
+    sid: &str,
+    content: &str,
+) {
     let mut session = crate::session::Session::new(
         crate::types::ConversationId(sid.to_string()),
         session_db.clone(),
@@ -1098,7 +1104,7 @@ async fn write_user_message(session_db: &eidetica::Database, sid: &str) {
     session
         .add_entry(crate::session::SessionEntry {
             sender: "user".to_string(),
-            content: "hello".to_string(),
+            content: content.to_string(),
             timestamp: Utc::now(),
             entry_type: EntryType::Message,
             metadata: None,
@@ -1106,6 +1112,10 @@ async fn write_user_message(session_db: &eidetica::Database, sid: &str) {
         })
         .await
         .expect("write user message");
+}
+
+async fn write_user_message(session_db: &eidetica::Database, sid: &str) {
+    write_user_message_with_content(session_db, sid, "hello").await;
 }
 
 #[tokio::test]
@@ -1152,7 +1162,7 @@ async fn process_session_skips_when_not_home_peer() {
     server.process_session(&sid).await.unwrap();
 
     // Gate released the lock inline before returning.
-    assert!(!server.processing.lock().await.contains(&sid));
+    assert!(!server.processing_contains(&sid).await);
 
     let entries_after = {
         let session = crate::session::Session::new(
@@ -1518,6 +1528,81 @@ async fn watch_session_is_transport_only_no_runtime_claim() {
 }
 
 #[tokio::test]
+async fn daemon_adoption_installs_the_session_db_approval_proxy() {
+    let (_instance, server, registry) = server_fixture().await;
+    server.set_approval_timeout(std::time::Duration::from_secs(1));
+    let (_conversation_id, session_db) = registry.create_session(Some("tui")).await.unwrap();
+    let session_db_id = session_db.root_id().to_string();
+
+    let watcher = tokio::spawn({
+        let server = server.clone();
+        async move { server.new_session_watcher().await }
+    });
+    for _ in 0..100 {
+        if server.is_watching_session(&session_db_id).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(server.is_watching_session(&session_db_id).await);
+
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+    let security = SecurityContext {
+        leak_detector: crate::security::LeakDetector::new(crate::security::LeakPolicy::default()),
+        auto_approved_tools: Default::default(),
+        approval_callback: Some(approval_tx),
+    };
+    let ask = crate::tool::ToolApprovalInfo {
+        name: "shell".to_string(),
+        arguments_display: "ls".to_string(),
+        risk_level: crate::tool::RiskLevel::High,
+    };
+    let decision = tokio::spawn(async move { security.request_approval(ask).await });
+    let exchange = approval_rx.recv().await.expect("test asks approval");
+    let runtime_tx = {
+        let sessions = server.sessions.lock().await;
+        sessions
+            .get(&session_db_id)
+            .and_then(|runtime| runtime.approval_tx.clone())
+            .expect("daemon adoption installs an approval proxy")
+    };
+    runtime_tx.send(exchange).await.unwrap();
+
+    let mut session = Session::new(ConversationId(session_db_id), session_db.clone()).await;
+    for _ in 0..100 {
+        if let Some(request) = session
+            .entries()
+            .iter()
+            .find_map(crate::bridge::parse_approval_request)
+        {
+            assert_eq!(request.timeout_secs, 1, "proxy uses the daemon timeout");
+            session
+                .add_entry(crate::bridge::approval_decision_entry(
+                    "local-user",
+                    &request.request_id,
+                    crate::bridge::ApprovalDecision::Approve,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                decision.await.unwrap(),
+                crate::bridge::ApprovalDecision::Approve
+            );
+            watcher.abort();
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        session = Session::new(
+            ConversationId(session_db.root_id().to_string()),
+            session_db.clone(),
+        )
+        .await;
+    }
+    watcher.abort();
+    panic!("daemon approval proxy did not persist a request");
+}
+
+#[tokio::test]
 async fn claim_runtime_fires_exactly_once_second_caller_errors() {
     let (_instance, server, registry) = server_fixture().await;
     let (session_db, backend) = fresh_session_and_backend(&registry).await;
@@ -1767,6 +1852,112 @@ async fn a_local_write_wakes_the_agent() {
     assert!(
         await_agent_reply(&session_db, &sid, "alpha").await,
         "a locally committed write must drive the agent loop"
+    );
+}
+
+/// A second user message can land after the first task assembled context but
+/// before it releases the per-session slot. It must get its own daemon turn;
+/// otherwise the first reply becomes the latest entry and strands the message.
+#[tokio::test]
+async fn a_message_arriving_during_a_turn_gets_a_follow_up_turn() {
+    use crate::test_support::MockBackend;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+
+    let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+    let sid = session_db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("first reply");
+    mock.push_text("second reply");
+    // A third response is intentionally available: the broken wake gate
+    // consumes it by answering `world` twice. Without it, the extra call can
+    // fail quickly and race this assertion, laundering a duplicate model
+    // request into a two-call green.
+    mock.push_text("duplicate reply");
+    let gate = mock.block_next_call();
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&session_db, backend, Some("alpha".to_string()), None)
+        .await
+        .unwrap();
+
+    write_user_message_with_content(&session_db, &sid, "hello").await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), gate.wait_started())
+        .await
+        .expect("first turn did not reach the backend");
+    assert_eq!(mock.recorded_calls().len(), 1, "first turn did not start");
+    assert!(
+        server.processing_contains(&sid).await,
+        "first turn is not active"
+    );
+
+    write_user_message_with_content(&session_db, &sid, "world").await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        server.await_processing_pending_for_test(&sid),
+    )
+    .await
+    .expect("session write did not mark the follow-up turn pending");
+    gate.release();
+    for _ in 0..100 {
+        if mock.recorded_calls().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // A self-write from the second turn must not enqueue a third copy of the
+    // same context. Wait until the second turn releases its slot, then give
+    // any erroneous wake one scheduler window to consume the deliberately
+    // queued third response.
+    for _ in 0..100 {
+        if !server.processing_contains(&sid).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let calls = mock.recorded_calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "world was stranded without a follow-up turn"
+    );
+    assert!(
+        calls[1].messages.iter().any(|message| matches!(
+            message,
+            crate::runtime::RuntimeMessage::User(content) if content == "world"
+        )),
+        "follow-up turn did not include world"
+    );
+}
+
+#[tokio::test]
+async fn releasing_a_schedule_turn_wakes_its_pending_message() {
+    let processing = Arc::new(tokio::sync::Mutex::new(super::ProcessingState::default()));
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(1);
+    let sid = "schedule-session";
+    {
+        let mut state = processing.lock().await;
+        state.active.insert(sid.to_string(), 0);
+        state.pending.insert(sid.to_string());
+    }
+
+    super::release_processing_slot(&processing, &notify_tx, sid).await;
+
+    assert_eq!(notify_rx.recv().await.as_deref(), Some(sid));
+    assert!(
+        !processing.lock().await.active.contains_key(sid),
+        "the schedule turn must release its active slot"
     );
 }
 

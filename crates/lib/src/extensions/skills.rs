@@ -171,18 +171,21 @@ pub struct SkillsExtension {
     /// Hosted index of locally tracked skill banks (for /skills
     /// list / grant / revoke / share / unshare / import / attach).
     skill_bank_index: HostedIndex,
+    memory_bank_index: HostedIndex,
 }
 
 impl SkillsExtension {
     pub fn new(
         session_registry: Arc<SessionRegistry>,
         agent_index: HostedIndex,
+        memory_bank_index: HostedIndex,
         skill_bank_index: HostedIndex,
     ) -> Self {
         Self {
             disk_registry: Arc::new(std::sync::RwLock::new(SkillRegistry::new())),
             session_registry,
             agent_index,
+            memory_bank_index,
             skill_bank_index,
         }
     }
@@ -234,6 +237,7 @@ impl Extension for SkillsExtension {
         let disk = self.disk_registry.clone();
         let registry = self.session_registry.clone();
         let agent_index = self.agent_index.clone();
+        let memory_bank_index = self.memory_bank_index.clone();
         let skill_bank_index = self.skill_bank_index.clone();
         let manifest = self.manifest();
         Box::pin(async move {
@@ -252,6 +256,7 @@ impl Extension for SkillsExtension {
                         disk,
                         registry,
                         agent_index,
+                        memory_bank_index,
                         skill_bank_index,
                     })
                         as Arc<dyn crate::extension::ExtensionInstance>)
@@ -298,6 +303,7 @@ struct SkillsGlobalInstance {
     disk: Arc<std::sync::RwLock<SkillRegistry>>,
     registry: Arc<SessionRegistry>,
     agent_index: HostedIndex,
+    memory_bank_index: HostedIndex,
     skill_bank_index: HostedIndex,
 }
 
@@ -329,6 +335,7 @@ impl crate::extension::ExtensionInstance for SkillsGlobalInstance {
             Arc::new(SkillCommand {
                 registry: self.registry.clone(),
                 agent_index: self.agent_index.clone(),
+                memory_bank_index: self.memory_bank_index.clone(),
                 skill_bank_index: self.skill_bank_index.clone(),
             }),
         )]
@@ -920,6 +927,7 @@ impl Tool for SkillShowTool {
 struct SkillCommand {
     registry: Arc<SessionRegistry>,
     agent_index: HostedIndex,
+    memory_bank_index: HostedIndex,
     skill_bank_index: HostedIndex,
 }
 
@@ -1049,6 +1057,19 @@ impl SkillCommand {
                 display_name: name.to_string(),
                 pubkey,
             });
+        if let Err(e) = self
+            .registry
+            .publish_hosted_indices(
+                &self.agent_index,
+                &self.memory_bank_index,
+                &self.skill_bank_index,
+            )
+            .await
+        {
+            return ExtensionCommandOutcome::Error(format!(
+                "Created skill bank '{name}' but failed to publish the service catalog: {e}"
+            ));
+        }
         ExtensionCommandOutcome::Text(format!(
             "Created skill bank '{name}' (DB {}). Grant it to an agent with /skills grant.",
             bank.id()
@@ -1064,6 +1085,20 @@ impl SkillCommand {
             Err(msg) => return ExtensionCommandOutcome::Error(msg),
         };
         self.skill_bank_index.unregister(&entry.db_id);
+        if let Err(e) = self
+            .registry
+            .publish_hosted_indices(
+                &self.agent_index,
+                &self.memory_bank_index,
+                &self.skill_bank_index,
+            )
+            .await
+        {
+            return ExtensionCommandOutcome::Error(format!(
+                "Deleted skill bank '{}' but failed to publish the service catalog: {e}",
+                entry.display_name
+            ));
+        }
         ExtensionCommandOutcome::Text(format!(
             "Deleted skill bank '{}' (DB {} preserved for archive). Agents with this bank in \
              their skill_banks subtree will still see it listed — use /skills revoke to remove \
@@ -1349,6 +1384,14 @@ impl SkillCommand {
                  sync: {e}"
             ));
         }
+        self.registry
+            .publish_hosted_indices(
+                &self.agent_index,
+                &self.memory_bank_index,
+                &self.skill_bank_index,
+            )
+            .await
+            .map_err(|e| format!("Imported skill bank '{display_name}' but failed to publish the service catalog: {e}"))?;
         Ok(SkillImportOutcome::Imported {
             display_name,
             db_id,
@@ -2065,6 +2108,7 @@ mod tests {
         SkillsExtension::new(
             registry,
             crate::hosted_index::HostedIndex::empty("agent"),
+            crate::hosted_index::HostedIndex::empty("memory_bank"),
             crate::hosted_index::HostedIndex::empty("skill_bank"),
         )
     }

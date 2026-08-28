@@ -91,9 +91,12 @@ impl Bridge for CliBridge {
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
 
-        // Approval channel = None → auto-deny any tool needing approval.
+        // The daemon owns execution. This process is only a transport: it
+        // writes the prompt and watches the daemon-hosted session for the
+        // reply. Keeping the frontend's agent loop disabled is what prevents
+        // two concurrent `--print` clients from duplicating one turn.
         server
-            .register_session(&session_db, backend, None, None)
+            .watch_session(&session_db, backend, None, None)
             .await?;
 
         // Watch for the agent's response via on_write. The server already

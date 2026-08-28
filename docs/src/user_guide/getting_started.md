@@ -138,9 +138,8 @@ chaz --config config.yaml cmd '/sharing requests'
 ```
 
 The result goes to stdout, and a command that reports an error exits non-zero,
-so scripts can branch on it. Run it with the daemon stopped — it opens the same
-state directory, and two processes on one backend do not observe each other's
-writes.
+so scripts can branch on it. The command connects to the local daemon and
+starts it automatically when needed.
 
 ## Single-shot print mode
 
@@ -150,7 +149,7 @@ For scripted use or scheduling, run a single prompt and exit with `-p` / `--prin
 chaz --config config.yaml -p "Summarize the last meeting notes."
 ```
 
-There is no interactive approval — tools requiring approval are auto-denied unless they're in the print-mode auto-approved list (default: `shell`, `write_file`; override with the `cli:` config block). Pass `--session NAME` to reuse a named session across invocations instead of creating a fresh ephemeral one each time. Logs go to a rolling file in the state directory (`chaz-cli.log`); only the agent's reply goes to stdout so the output is pipe-friendly.
+There is no interactive approval: `UnlessAutoApproved` tools follow the daemon's ordinary `security.auto_approved_tools`, while `Always` tools fail closed. Pass `--session NAME` to reuse a named session across invocations instead of creating a fresh ephemeral one each time. Logs go to a rolling file in the state directory (`chaz-cli.log`); only the agent's reply goes to stdout so the output is pipe-friendly.
 
 ## Aggregated cost / usage
 

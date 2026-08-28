@@ -25,11 +25,15 @@ Usage: stub_llm.py <port> <reply-text>
 """
 
 import json
+import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(sys.argv[1])
 REPLY = sys.argv[2]
+REPLY_DELAY_SECONDS = float(os.environ.get("STUB_LLM_REPLY_DELAY_SECONDS", "0"))
+REPLY_WITH_REQUEST = os.environ.get("STUB_LLM_REPLY_WITH_REQUEST") == "1"
 
 # The phrase that asks for a tool call. Branching on the request content rather
 # than on a request counter keeps the tool call attached to the turn that asked
@@ -108,11 +112,15 @@ class Handler(BaseHTTPRequestHandler):
 
         has_tool_result = self._has_tool_result(messages)
         user_text = self._user_text(messages)
+        reply = f"{REPLY}: {user_text}" if REPLY_WITH_REQUEST else REPLY
 
-        # One line per request, carrying what the turn was given. Every reply
-        # this stub sends is the same string, so the room cannot show which
-        # turn produced which reply — a case that needs to know asserts here.
+        # One line per request, carrying what the turn was given. The default
+        # reply is fixed; a harness may opt into request-tagged replies when it
+        # must distinguish concurrent turns at the client boundary.
         sys.stderr.write("stub_llm: request: " + user_text + "\n")
+
+        if REPLY_DELAY_SECONDS:
+            time.sleep(REPLY_DELAY_SECONDS)
 
         if has_tool_result:
             sys.stderr.write(
@@ -127,7 +135,7 @@ class Handler(BaseHTTPRequestHandler):
                     "choices": [
                         {
                             "index": 0,
-                            "message": {"role": "assistant", "content": REPLY},
+                            "message": {"role": "assistant", "content": reply},
                             "finish_reason": "stop",
                         }
                     ],
@@ -183,7 +191,7 @@ class Handler(BaseHTTPRequestHandler):
                     "choices": [
                         {
                             "index": 0,
-                            "message": {"role": "assistant", "content": REPLY},
+                            "message": {"role": "assistant", "content": reply},
                             "finish_reason": "stop",
                         }
                     ],

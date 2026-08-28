@@ -46,6 +46,11 @@ e2e *args='':
     cargo build --quiet --bin chaz --bin chaz-matrix
     nix develop .#e2e --command dev/matrix-e2e/run.sh {{ args }}
 
+# Local frontend/daemon service integration test
+frontend-e2e:
+    cargo build --quiet --bin chaz
+    dev/frontend-service-e2e/run.sh
+
 # =============================================================================
 # Coverage
 # =============================================================================

@@ -59,10 +59,6 @@ pub struct BuildOptions {
     /// exposed sessions and runs them. Distinct from `run_routine_engine`,
     /// which only gates schedulers/heartbeats, not the ReAct message loop.
     pub run_agent_loop: bool,
-    /// Tools to add to the auto-approved set on top of `config.security`. The
-    /// CLI passes its non-interactive allowlist here so `shell`/`write_file`
-    /// work under `--print` where there is no interactive approval.
-    pub extra_auto_approved_tools: Vec<String>,
     /// Whether a turn may run before the configured MCP servers have
     /// finished starting. See [`McpReadiness`].
     pub mcp_readiness: McpReadiness,
@@ -116,6 +112,7 @@ pub async fn build(
     // Enable eidetica sync for session sharing. Register iroh P2P transport
     // by default (stable peer identity, no address config needed). If
     // sync_listen is configured, also bind HTTP for traditional access.
+    let mut sync_addresses = Vec::new();
     if opts.enable_sync {
         instance.enable_sync().await?;
         if let Some(sync) = instance.sync() {
@@ -159,6 +156,25 @@ pub async fn build(
             } else {
                 info!("Sync already accepting connections; keeping the existing address");
             }
+            sync_addresses = sync.get_all_server_addresses().await?;
+
+            // Remote frontends can update the user's tracked-DB settings over
+            // the service, but a connected Instance deliberately owns no Sync
+            // handle. Recompute the daemon's combined sync state whenever the
+            // authoritative preferences DB changes so `/agent share` and
+            // friends retain their transport-neutral command semantics.
+            let sync_for_prefs = sync.clone();
+            let user_uuid = user.user_uuid().to_string();
+            let preferences_id = user.user_database().root_id().clone();
+            user.user_database()
+                .on_write(move |_event, _db| {
+                    let sync = sync_for_prefs.clone();
+                    let user_uuid = user_uuid.clone();
+                    let preferences_id = preferences_id.clone();
+                    Box::pin(async move { sync.sync_user(&user_uuid, &preferences_id).await })
+                })
+                .await?
+                .detach();
         }
     }
 
@@ -201,6 +217,9 @@ pub async fn build(
 
     let t = Instant::now();
     let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
+    if !sync_addresses.is_empty() {
+        registry.publish_sync_addresses(&sync_addresses).await?;
+    }
     info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
         "Session registry initialized"
@@ -211,10 +230,35 @@ pub async fn build(
     // walking eidetica's tracked-DBs list. Each entry's `meta.kind` marker
     // classifies it. `/agent new`, `/memory new`, `/agent delete`, etc.
     // mutate these caches at runtime.
-    let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = {
+    let remote_client = registry.instance().remote_connection().is_some();
+    let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = if remote_client {
+        (
+            hosted_index::HostedIndex::empty("agent"),
+            hosted_index::HostedIndex::empty("memory_bank"),
+            hosted_index::HostedIndex::empty("skill_bank"),
+        )
+    } else {
         let user = registry.user_lock().await;
         hosted_index::build_from_user(&user).await?
     };
+
+    // A connected client must prove each hosted entity's per-DB key before it
+    // can read that tree, so its generic catalog walk cannot classify entities
+    // up front. The daemon publishes this peer-local index inside chaz_peer;
+    // clients read it through the authenticated service connection without
+    // changing entity keys or weakening per-tree authorization.
+    if remote_client {
+        let (agents, memory_banks, skill_banks) = registry.service_hosted_entities().await?;
+        for entry in agents {
+            agent_index_store.register(entry);
+        }
+        for entry in memory_banks {
+            memory_bank_index_store.register(entry);
+        }
+        for entry in skill_banks {
+            skill_bank_index_store.register(entry);
+        }
+    }
 
     // Surface pre-existing co-owned agents/sessions whose `home_pubkey` is
     // still unset (legacy default). These keep working as before — any
@@ -301,6 +345,20 @@ pub async fn build(
             }
         }
     }
+
+    // Bootstrap may auto-create default banks after the initial index walk,
+    // so the daemon publishes the final catalog only after that pass. Clients
+    // never publish: their index was hydrated from this catalog, not derived.
+    if !remote_client {
+        registry
+            .publish_hosted_entities(
+                &agent_index_store.list(),
+                &memory_bank_index_store.list(),
+                &skill_bank_index_store.list(),
+            )
+            .await?;
+    }
+
     // Build secret store backed by the chaz_peer DB.
     let secret_store = security::SecretStore::new(chaz_peer.clone()).await;
     if let Some(backends) = &mut config.backends {
@@ -355,16 +413,12 @@ pub async fn build(
         _ => security::LeakPolicy::Redact,
     };
     let leak_detector = security::LeakDetector::new(leak_policy);
-    let mut auto_approved: std::collections::HashSet<String> = sec
+    let auto_approved: std::collections::HashSet<String> = sec
         .auto_approved_tools
         .clone()
         .unwrap_or_default()
         .into_iter()
         .collect();
-
-    // Caller-supplied extras (the CLI's non-interactive allowlist under
-    // `--print`, where shell/write_file have no interactive approval).
-    auto_approved.extend(opts.extra_auto_approved_tools);
 
     let security_ctx = security::SecurityContext {
         leak_detector,
@@ -522,6 +576,11 @@ pub async fn build(
         mcp_registry.clone(),
         opts.run_agent_loop,
     );
+    server.set_runtime_mode(config.runtime.unwrap_or(if opts.run_agent_loop {
+        config::RuntimeMode::Auto
+    } else {
+        config::RuntimeMode::Never
+    }));
     assert!(
         spawn_server_cell.set(server.clone()).is_ok(),
         "Spawn tool server cell already set"
