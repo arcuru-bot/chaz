@@ -254,11 +254,7 @@ impl Server {
             )
             .await;
 
-        // Release the processing lock.
-        {
-            let mut processing = self.processing.lock().await;
-            processing.active.remove(&session_db_id);
-        }
+        release_processing_slot(&self.processing, &self.notify_tx, &session_db_id).await;
 
         // 5. Record ScheduleFire on the agent's DB (best-effort audit).
         let fired_at = Utc::now();

@@ -72,6 +72,19 @@ wait_for() {
 	fail "timed out waiting for $what"
 }
 
+wait_for_child() {
+	local pid="$1" what="$2" timeout="$3"
+	local deadline=$((SECONDS + timeout))
+	while ((SECONDS < deadline)); do
+		if ! kill -0 "$pid" 2>/dev/null; then
+			wait "$pid"
+			return
+		fi
+		sleep 0.05
+	done
+	fail "timed out waiting for $what"
+}
+
 daemon_pid_for_socket() {
 	ss -xlpn | awk -v socket="$STATE/eidetica.sock" '
 		index($0, socket) && match($0, /pid=[0-9]+/) { pid = substr($0, RSTART + 4, RLENGTH - 4) }
@@ -98,7 +111,7 @@ print(s.getsockname()[1])
 s.close()
 PY
 )"
-STUB_LLM_REPLY_WITH_REQUEST=1 \
+STUB_LLM_REPLY_WITH_REQUEST=1 STUB_LLM_REPLY_DELAY_SECONDS=5 \
 	python3 "$STUB_LLM" "$STUB_PORT" "frontend service stub reply" \
 	>"$WORKSPACE/stub-llm.stdout" 2>&1 &
 STUB_PID="$!"
@@ -161,10 +174,14 @@ wait_for "first daemon model request" 30 sh -c \
 "$CHAZ_BIN" --config "$CONFIG" --print --session duplicate-turn world \
 	>"$WORKSPACE/print-b.out" 2>"$WORKSPACE/print-b.err" &
 PRINT_B_PID="$!"
-wait "$PRINT_A_PID" || fail "first concurrent print frontend failed"
+wait_for_child "$PRINT_A_PID" "first concurrent print frontend" 30 ||
+	fail "first concurrent print frontend failed"
 PRINT_A_PID=""
-wait "$PRINT_B_PID" || fail "second concurrent print frontend failed"
+wait_for_child "$PRINT_B_PID" "second concurrent print frontend" 30 ||
+	fail "second concurrent print frontend failed"
 PRINT_B_PID=""
+wait_for "follow-up daemon model request" 30 sh -c \
+	"test \$(grep -c '^stub_llm: request:' '$WORKSPACE/stub-llm.stdout' || true) -eq $((REQUESTS_BEFORE + 2))"
 grep -q 'frontend service stub reply: hello' "$WORKSPACE/print-a.out" ||
 	fail "first print frontend did not receive its hello turn"
 # Both print clients may observe the first reply: that is a transport race, not

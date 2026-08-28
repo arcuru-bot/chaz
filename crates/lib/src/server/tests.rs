@@ -1897,9 +1897,12 @@ async fn a_message_arriving_during_a_turn_gets_a_follow_up_turn() {
     );
 
     write_user_message_with_content(&session_db, &sid, "world").await;
-    // Let the session write callback mark the durable follow-up before the
-    // first task is released.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        server.await_processing_pending_for_test(&sid),
+    )
+    .await
+    .expect("session write did not mark the follow-up turn pending");
     gate.release();
     for _ in 0..100 {
         if mock.recorded_calls().len() == 2 {
@@ -1919,6 +1922,26 @@ async fn a_message_arriving_during_a_turn_gets_a_follow_up_turn() {
             crate::runtime::RuntimeMessage::User(content) if content == "world"
         )),
         "follow-up turn did not include world"
+    );
+}
+
+#[tokio::test]
+async fn releasing_a_schedule_turn_wakes_its_pending_message() {
+    let processing = Arc::new(tokio::sync::Mutex::new(super::ProcessingState::default()));
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(1);
+    let sid = "schedule-session";
+    {
+        let mut state = processing.lock().await;
+        state.active.insert(sid.to_string());
+        state.pending.insert(sid.to_string());
+    }
+
+    super::release_processing_slot(&processing, &notify_tx, sid).await;
+
+    assert_eq!(notify_rx.recv().await.as_deref(), Some(sid));
+    assert!(
+        !processing.lock().await.active.contains(sid),
+        "the schedule turn must release its active slot"
     );
 }
 

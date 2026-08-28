@@ -170,6 +170,23 @@ struct ProcessingState {
     pending: std::collections::HashSet<String>,
 }
 
+/// Release a session's turn slot and re-wake the processing loop when a
+/// durable message arrived after that turn captured its context.
+async fn release_processing_slot(
+    processing: &Mutex<ProcessingState>,
+    notify_tx: &mpsc::Sender<String>,
+    session_db_id: &str,
+) {
+    let wake_pending = {
+        let mut state = processing.lock().await;
+        state.active.remove(session_db_id);
+        state.pending.contains(session_db_id)
+    };
+    if wake_pending {
+        let _ = notify_tx.send(session_db_id.to_string()).await;
+    }
+}
+
 /// Built-in default for the agent→agent burst budget — the run of
 /// consecutive agent-authored messages since the last human message or
 /// `Directive`. Once the trailing burst reaches this, mention-chained
@@ -359,6 +376,9 @@ pub struct Server {
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sessions currently being processed (prevents concurrent agent runs per session)
     processing: Arc<Mutex<ProcessingState>>,
+    /// Signals tests when an active session records a durable follow-up turn.
+    #[cfg(test)]
+    pending_notify: Arc<tokio::sync::Notify>,
     /// Home-peer gate skip counter keyed by `(session_db_id, agent_name)`.
     /// In-memory, peer-local. Incremented on every wake that the gate
     /// suppresses; cleared when a turn actually runs (home == self) or on
@@ -481,6 +501,8 @@ impl Server {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(ProcessingState::default())),
+            #[cfg(test)]
+            pending_notify: Arc::new(tokio::sync::Notify::new()),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
             notify_tx,
@@ -869,6 +891,17 @@ impl Server {
     #[cfg(test)]
     async fn processing_contains(&self, session_db_id: &str) -> bool {
         self.processing.lock().await.active.contains(session_db_id)
+    }
+
+    #[cfg(test)]
+    async fn await_processing_pending_for_test(&self, session_db_id: &str) {
+        loop {
+            let notified = self.pending_notify.notified();
+            if self.processing.lock().await.pending.contains(session_db_id) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     #[cfg(test)]
@@ -1509,6 +1542,8 @@ impl Server {
         let sid = session_db_id.clone();
         let processing = self.processing.clone();
         let agents = self.agents.clone();
+        #[cfg(test)]
+        let pending_notify = self.pending_notify.clone();
         session_db
             .on_write(move |event, db| {
                 // Deliberately not gated on the source. A co-owner pushing
@@ -1522,6 +1557,8 @@ impl Server {
                 let sid = sid.clone();
                 let processing = processing.clone();
                 let agents = agents.clone();
+                #[cfg(test)]
+                let pending_notify = pending_notify.clone();
                 let db = db.clone();
                 Box::pin(async move {
                     // A human write can arrive after the active task has
@@ -1538,6 +1575,8 @@ impl Server {
                         let mut state = processing.lock().await;
                         if state.active.contains(&sid) {
                             state.pending.insert(sid.clone());
+                            #[cfg(test)]
+                            pending_notify.notify_one();
                         }
                     }
                     let _ = tx.send(sid).await;
@@ -1715,6 +1754,8 @@ impl Server {
             let sid = session_db_id.clone();
             let processing = self.processing.clone();
             let agents = self.agents.clone();
+            #[cfg(test)]
+            let pending_notify = self.pending_notify.clone();
             session_db
                 .on_write(move |event, db| {
                     // Source-agnostic for the same reason as `watch_session`:
@@ -1725,6 +1766,8 @@ impl Server {
                     let sid = sid.clone();
                     let processing = processing.clone();
                     let agents = agents.clone();
+                    #[cfg(test)]
+                    let pending_notify = pending_notify.clone();
                     let db = db.clone();
                     Box::pin(async move {
                         let session = Session::new(ConversationId(sid.clone()), db).await;
@@ -1736,6 +1779,8 @@ impl Server {
                             let mut state = processing.lock().await;
                             if state.active.contains(&sid) {
                                 state.pending.insert(sid.clone());
+                                #[cfg(test)]
+                                pending_notify.notify_one();
                             }
                         }
                         let _ = tx.send(sid).await;
@@ -2385,14 +2430,7 @@ impl Server {
             }
             drop(s);
 
-            let wake_pending = {
-                let mut state = spawn.processing.lock().await;
-                state.active.remove(&session_db_id);
-                state.pending.contains(&session_db_id)
-            };
-            if wake_pending {
-                let _ = spawn.notify_tx.send(session_db_id.clone()).await;
-            }
+            release_processing_slot(&spawn.processing, &spawn.notify_tx, &session_db_id).await;
 
             if let Some(tx) = spawn.completion_tx {
                 let _ = tx.send(()).await;

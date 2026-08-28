@@ -1239,8 +1239,9 @@ async fn relay_pending_approvals(
         }
         let db = db.clone();
         let pending = pending.clone();
+        let timeout = std::time::Duration::from_secs(request.timeout_secs);
         tokio::spawn(async move {
-            let Ok(decision) = decision_rx.await else {
+            let Ok(Ok(decision)) = tokio::time::timeout(timeout, decision_rx).await else {
                 pending
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -2297,14 +2298,16 @@ mod tests {
         (instance, db, tx, rx)
     }
 
-    async fn add_request(db: &eidetica::Database) -> String {
+    async fn add_request_with_timeout(
+        db: &eidetica::Database,
+        timeout: std::time::Duration,
+    ) -> String {
         let info = ToolApprovalInfo {
             name: "shell".to_string(),
             arguments_display: "ls".to_string(),
             risk_level: RiskLevel::High,
         };
-        let (request_id, entry) =
-            approval_request_entry("daemon", &info, std::time::Duration::from_secs(60));
+        let (request_id, entry) = approval_request_entry("daemon", &info, timeout);
         let mut session = Session::new(
             chaz_core::types::ConversationId(db.root_id().to_string()),
             db.clone(),
@@ -2312,6 +2315,10 @@ mod tests {
         .await;
         session.add_entry(entry).await.unwrap();
         request_id
+    }
+
+    async fn add_request(db: &eidetica::Database) -> String {
+        add_request_with_timeout(db, std::time::Duration::from_secs(60)).await
     }
 
     #[tokio::test]
@@ -2335,6 +2342,28 @@ mod tests {
             .exchange
             .decision_tx
             .send(chaz_core::bridge::ApprovalDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn unanswered_local_approval_relay_expires() {
+        let (_instance, db, tx, mut rx) = test_db().await;
+        let request_id = add_request_with_timeout(&db, std::time::Duration::from_millis(25)).await;
+        let pending = Arc::new(StdMutex::new(HashSet::new()));
+
+        relay_pending_approvals(db, "test-session".to_string(), tx, pending.clone()).await;
+        let tagged = rx.recv().await.expect("request must relay");
+        assert_eq!(tagged.request_id, request_id);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if pending.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("unanswered local approval relay did not expire");
     }
 
     #[tokio::test]
@@ -2390,6 +2419,16 @@ mod tests {
         let tagged = rx.recv().await.expect("preexisting request must surface");
         assert_eq!(tagged.request_id, request_id);
 
+        let second_request_id = add_request(&db).await;
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("second request callback did not relay")
+            .expect("approval relay channel closed");
+        assert_eq!(
+            second.request_id, second_request_id,
+            "a distinct unresolved request must relay after setup"
+        );
+
         let mut session = Session::new(
             chaz_core::types::ConversationId(db.root_id().to_string()),
             db.clone(),
@@ -2413,6 +2452,10 @@ mod tests {
             "a later write must not duplicate the prompt"
         );
         let _ = tagged
+            .exchange
+            .decision_tx
+            .send(chaz_core::bridge::ApprovalDecision::Deny);
+        let _ = second
             .exchange
             .decision_tx
             .send(chaz_core::bridge::ApprovalDecision::Deny);
