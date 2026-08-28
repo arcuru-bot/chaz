@@ -758,16 +758,18 @@ async fn agent_schedule_processing_lock_skips_busy_session() {
 
     // Manually insert the session into the processing set to simulate
     // a busy session.
-    server.processing.lock().await.insert(session_db_id.clone());
+    server
+        .insert_processing_for_test(session_db_id.clone())
+        .await;
 
     let payload = pinned_schedule_payload(&entry.db_id.to_string(), "t1", "wake", &session_db_id);
     let result = server.fire_agent_schedule(payload).await;
     assert!(result.is_ok(), "busy session should be skipped gracefully");
 
     // The lock should still be held (we inserted it manually).
-    assert!(server.processing.lock().await.contains(&session_db_id));
+    assert!(server.processing_contains(&session_db_id).await);
     // Clean up.
-    server.processing.lock().await.remove(&session_db_id);
+    server.remove_processing_for_test(&session_db_id).await;
 }
 
 #[tokio::test]
@@ -1089,7 +1091,11 @@ fn register_alpha_agent_runtime(server: &Server) {
     });
 }
 
-async fn write_user_message(session_db: &eidetica::Database, sid: &str) {
+async fn write_user_message_with_content(
+    session_db: &eidetica::Database,
+    sid: &str,
+    content: &str,
+) {
     let mut session = crate::session::Session::new(
         crate::types::ConversationId(sid.to_string()),
         session_db.clone(),
@@ -1098,7 +1104,7 @@ async fn write_user_message(session_db: &eidetica::Database, sid: &str) {
     session
         .add_entry(crate::session::SessionEntry {
             sender: "user".to_string(),
-            content: "hello".to_string(),
+            content: content.to_string(),
             timestamp: Utc::now(),
             entry_type: EntryType::Message,
             metadata: None,
@@ -1106,6 +1112,10 @@ async fn write_user_message(session_db: &eidetica::Database, sid: &str) {
         })
         .await
         .expect("write user message");
+}
+
+async fn write_user_message(session_db: &eidetica::Database, sid: &str) {
+    write_user_message_with_content(session_db, sid, "hello").await;
 }
 
 #[tokio::test]
@@ -1152,7 +1162,7 @@ async fn process_session_skips_when_not_home_peer() {
     server.process_session(&sid).await.unwrap();
 
     // Gate released the lock inline before returning.
-    assert!(!server.processing.lock().await.contains(&sid));
+    assert!(!server.processing_contains(&sid).await);
 
     let entries_after = {
         let session = crate::session::Session::new(
@@ -1767,6 +1777,73 @@ async fn a_local_write_wakes_the_agent() {
     assert!(
         await_agent_reply(&session_db, &sid, "alpha").await,
         "a locally committed write must drive the agent loop"
+    );
+}
+
+/// A second user message can land after the first task assembled context but
+/// before it releases the per-session slot. It must get its own daemon turn;
+/// otherwise the first reply becomes the latest entry and strands the message.
+#[tokio::test]
+async fn a_message_arriving_during_a_turn_gets_a_follow_up_turn() {
+    use crate::test_support::MockBackend;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+
+    let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+    let sid = session_db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("first reply");
+    mock.push_text("second reply");
+    let gate = mock.block_next_call();
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&session_db, backend, Some("alpha".to_string()), None)
+        .await
+        .unwrap();
+
+    write_user_message_with_content(&session_db, &sid, "hello").await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), gate.wait_started())
+        .await
+        .expect("first turn did not reach the backend");
+    assert_eq!(mock.recorded_calls().len(), 1, "first turn did not start");
+    assert!(
+        server.processing_contains(&sid).await,
+        "first turn is not active"
+    );
+
+    write_user_message_with_content(&session_db, &sid, "world").await;
+    // Let the session write callback mark the durable follow-up before the
+    // first task is released.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    gate.release();
+    for _ in 0..100 {
+        if mock.recorded_calls().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let calls = mock.recorded_calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "world was stranded without a follow-up turn"
+    );
+    assert!(
+        calls[1].messages.iter().any(|message| matches!(
+            message,
+            crate::runtime::RuntimeMessage::User(content) if content == "world"
+        )),
+        "follow-up turn did not include world"
     );
 }
 

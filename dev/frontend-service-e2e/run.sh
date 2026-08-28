@@ -10,6 +10,8 @@ CONFIG="$WORKSPACE/config.yaml"
 DAEMON_PID=""
 DISABLED_DAEMON_PID=""
 STUB_PID=""
+PRINT_A_PID=""
+PRINT_B_PID=""
 CLEANUP_REGRESSION="${CLEANUP_REGRESSION:-0}"
 CLEANUP_REGRESSION_DAEMON_ADOPTED=0
 
@@ -34,6 +36,8 @@ cleanup() {
 	local status=$? cleanup_failed=0
 	terminate_and_wait "$DAEMON_PID" "service daemon" || cleanup_failed=1
 	terminate_and_wait "$DISABLED_DAEMON_PID" "service-disabled daemon" || cleanup_failed=1
+	terminate_and_wait "$PRINT_A_PID" "first print frontend" || cleanup_failed=1
+	terminate_and_wait "$PRINT_B_PID" "second print frontend" || cleanup_failed=1
 	terminate_and_wait "$STUB_PID" "stub LLM" || cleanup_failed=1
 	if [[ $CLEANUP_REGRESSION == 1 && $CLEANUP_REGRESSION_DAEMON_ADOPTED == 1 && $cleanup_failed -eq 0 ]]; then
 		printf 'PASS — forced post-autostart failure left no service daemon\n' >&2
@@ -94,7 +98,8 @@ print(s.getsockname()[1])
 s.close()
 PY
 )"
-python3 "$STUB_LLM" "$STUB_PORT" "frontend service stub reply" \
+STUB_LLM_REPLY_WITH_REQUEST=1 \
+	python3 "$STUB_LLM" "$STUB_PORT" "frontend service stub reply" \
 	>"$WORKSPACE/stub-llm.stdout" 2>&1 &
 STUB_PID="$!"
 wait_for "stub LLM" 30 sh -c \
@@ -144,24 +149,31 @@ if [[ $CLEANUP_REGRESSION == 1 ]]; then
 fi
 
 # `--print` exercises the transport-only frontend path against the daemon's
-# runtime. Two frontend processes watch the same named session while one user
-# message lands; only the daemon may turn that write into a model request.
+# runtime. Start B after A's request has crossed the daemon context boundary.
+# The request-tagged stub and trace assertions distinguish the two turns even
+# though both clients use the same generic frontend protocol.
 REQUESTS_BEFORE="$(grep -c '^stub_llm: request:' "$WORKSPACE/stub-llm.stdout" || true)"
 "$CHAZ_BIN" --config "$CONFIG" --print --session duplicate-turn hello \
 	>"$WORKSPACE/print-a.out" 2>"$WORKSPACE/print-a.err" &
 PRINT_A_PID="$!"
-wait_for "first print frontend session" 30 sh -c \
-	"grep -q 'source=Some(\"duplicate-turn\")' '$STATE'/chaz-daemon.*.log"
+wait_for "first daemon model request" 30 sh -c \
+	"test \$(grep -c '^stub_llm: request:' '$WORKSPACE/stub-llm.stdout' || true) -eq $((REQUESTS_BEFORE + 1))"
 "$CHAZ_BIN" --config "$CONFIG" --print --session duplicate-turn world \
 	>"$WORKSPACE/print-b.out" 2>"$WORKSPACE/print-b.err" &
 PRINT_B_PID="$!"
 wait "$PRINT_A_PID" || fail "first concurrent print frontend failed"
+PRINT_A_PID=""
 wait "$PRINT_B_PID" || fail "second concurrent print frontend failed"
-grep -q 'stub' "$WORKSPACE/print-a.out" || fail "first print frontend returned an unexpected response"
-grep -q 'stub' "$WORKSPACE/print-b.out" || fail "second print frontend returned an unexpected response"
+PRINT_B_PID=""
+grep -q 'frontend service stub reply: hello' "$WORKSPACE/print-a.out" ||
+	fail "first print frontend did not receive its hello turn"
+# Both print clients may observe the first reply: that is a transport race, not
+# a second runtime. The stub trace below is the authoritative daemon boundary.
 REQUESTS_AFTER="$(grep -c '^stub_llm: request:' "$WORKSPACE/stub-llm.stdout" || true)"
-[[ $((REQUESTS_AFTER - REQUESTS_BEFORE)) -eq 1 ]] ||
-	fail "two concurrent frontends produced $((REQUESTS_AFTER - REQUESTS_BEFORE)) model turns instead of one coalesced daemon turn"
+[[ $((REQUESTS_AFTER - REQUESTS_BEFORE)) -eq 2 ]] ||
+	fail "named frontend writes produced $((REQUESTS_AFTER - REQUESTS_BEFORE)) daemon turns instead of two"
+[[ $(grep -c '^stub_llm: request: .*world' "$WORKSPACE/stub-llm.stdout" || true) -eq 1 ]] ||
+	fail "world was not incorporated by exactly one daemon turn"
 
 # A subsequent command reads the same named session.
 PRINT_OUT="$("$CHAZ_BIN" --config "$CONFIG" --print --session print-shared hello \
@@ -269,7 +281,7 @@ wait_for "service-disabled daemon shutdown" 30 sh -c "! kill -0 $DISABLED_DAEMON
 DISABLED_DAEMON_PID=""
 
 printf 'PASS — 8 concurrent frontends converged on one detached daemon\n'
-printf 'PASS — concurrent --print clients left all model turns daemon-owned\n'
+printf 'PASS — concurrent --print clients left two ordered model turns daemon-owned\n'
 printf 'PASS — --print completed a real callback-driven turn over the service\n'
 printf 'PASS — command and usage clients had bidirectional state visibility\n'
 printf 'PASS — clients read the hosted agent and memory bank indices over the service\n'

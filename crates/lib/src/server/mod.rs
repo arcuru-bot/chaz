@@ -154,8 +154,20 @@ struct SpawnContext {
     /// fresh top-level run (the task builder allocates one).
     iteration_budget: Option<Arc<AtomicU32>>,
     completion_tx: Option<mpsc::Sender<()>>,
-    /// Per-session processing lock — cleared when the task completes
-    processing: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Per-session turn state. The completing task releases its active slot
+    /// and wakes a queued durable message, if one arrived after its context
+    /// snapshot.
+    processing: Arc<Mutex<ProcessingState>>,
+    notify_tx: mpsc::Sender<String>,
+}
+
+/// Per-session turn state. `pending` records a processable durable write that
+/// arrived while a turn was active; it is consumed by the next turn even if
+/// the just-completed agent reply is now the latest entry.
+#[derive(Default)]
+struct ProcessingState {
+    active: std::collections::HashSet<String>,
+    pending: std::collections::HashSet<String>,
 }
 
 /// Built-in default for the agent→agent burst budget — the run of
@@ -346,7 +358,7 @@ pub struct Server {
     /// Track which session DBs have server callbacks registered
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sessions currently being processed (prevents concurrent agent runs per session)
-    processing: Arc<Mutex<std::collections::HashSet<String>>>,
+    processing: Arc<Mutex<ProcessingState>>,
     /// Home-peer gate skip counter keyed by `(session_db_id, agent_name)`.
     /// In-memory, peer-local. Incremented on every wake that the gate
     /// suppresses; cleared when a turn actually runs (home == self) or on
@@ -468,7 +480,7 @@ impl Server {
             prompt_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            processing: Arc::new(Mutex::new(ProcessingState::default())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
             notify_tx,
@@ -852,6 +864,21 @@ impl Server {
             .get(&(session_db_id.to_string(), agent_name.to_string()))
             .copied()
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    async fn processing_contains(&self, session_db_id: &str) -> bool {
+        self.processing.lock().await.active.contains(session_db_id)
+    }
+
+    #[cfg(test)]
+    async fn insert_processing_for_test(&self, session_db_id: String) {
+        self.processing.lock().await.active.insert(session_db_id);
+    }
+
+    #[cfg(test)]
+    async fn remove_processing_for_test(&self, session_db_id: &str) {
+        self.processing.lock().await.active.remove(session_db_id);
     }
 
     /// Override the agent→agent burst budget. Called once at startup
@@ -1480,8 +1507,10 @@ impl Server {
 
         let tx = self.notify_tx.clone();
         let sid = session_db_id.clone();
+        let processing = self.processing.clone();
+        let agents = self.agents.clone();
         session_db
-            .on_write(move |event, _db| {
+            .on_write(move |event, db| {
                 // Deliberately not gated on the source. A co-owner pushing
                 // into a shared session arrives as `Remote`, and that has to
                 // wake the agent here exactly as a local commit does — that
@@ -1491,7 +1520,26 @@ impl Server {
                 debug!(session_db_id = %sid, source = ?event.source(), "Session write; waking the processing loop");
                 let tx = tx.clone();
                 let sid = sid.clone();
+                let processing = processing.clone();
+                let agents = agents.clone();
+                let db = db.clone();
                 Box::pin(async move {
+                    // A human write can arrive after the active task has
+                    // assembled its context. Remember it before merely
+                    // waking the loop: by the time the wake is consumed, the
+                    // agent reply may be the latest entry and otherwise hides
+                    // this durable message from the normal latest-entry gate.
+                    let session = Session::new(ConversationId(sid.clone()), db).await;
+                    if session.latest_entry().is_some_and(|entry| {
+                        matches!(entry.entry_type, EntryType::Directive)
+                            || (entry.entry_type == EntryType::Message
+                                && agents.get(&entry.sender).is_none())
+                    }) {
+                        let mut state = processing.lock().await;
+                        if state.active.contains(&sid) {
+                            state.pending.insert(sid.clone());
+                        }
+                    }
                     let _ = tx.send(sid).await;
                     Ok(())
                 })
@@ -1665,15 +1713,31 @@ impl Server {
 
             let tx = self.notify_tx.clone();
             let sid = session_db_id.clone();
+            let processing = self.processing.clone();
+            let agents = self.agents.clone();
             session_db
-                .on_write(move |event, _db| {
+                .on_write(move |event, db| {
                     // Source-agnostic for the same reason as `watch_session`:
                     // a spawned child can be co-owned too, and a peer's write
                     // into it has to advance the run.
                     debug!(session_db_id = %sid, source = ?event.source(), "Child session write; waking the processing loop");
                     let tx = tx.clone();
                     let sid = sid.clone();
+                    let processing = processing.clone();
+                    let agents = agents.clone();
+                    let db = db.clone();
                     Box::pin(async move {
+                        let session = Session::new(ConversationId(sid.clone()), db).await;
+                        if session.latest_entry().is_some_and(|entry| {
+                            matches!(entry.entry_type, EntryType::Directive)
+                                || (entry.entry_type == EntryType::Message
+                                    && agents.get(&entry.sender).is_none())
+                        }) {
+                            let mut state = processing.lock().await;
+                            if state.active.contains(&sid) {
+                                state.pending.insert(sid.clone());
+                            }
+                        }
                         let _ = tx.send(sid).await;
                         Ok(())
                     })
@@ -1917,7 +1981,7 @@ impl Server {
             EntryType::Message => agent_to_agent_target.is_some(),
             EntryType::Directive => true,
             _ => false,
-        };
+        } || self.processing.lock().await.pending.contains(session_db_id);
         if !should_process {
             return Ok(());
         }
@@ -1937,9 +2001,13 @@ impl Server {
 
         {
             let mut processing = self.processing.lock().await;
-            if !processing.insert(session_db_id.to_string()) {
+            if !processing.active.insert(session_db_id.to_string()) {
                 return Ok(());
             }
+            // A completing turn woke us because a user write landed after it
+            // captured context. Consume that durable wake only after we own
+            // the active slot; wakes that find an active turn leave it set.
+            processing.pending.remove(session_db_id);
         }
         let (backend, agent_override, approval_tx, spawn_ctx) = {
             let sessions = self.sessions.lock().await;
@@ -1955,11 +2023,12 @@ impl Server {
                         iteration_budget: m.iteration_budget.clone(),
                         completion_tx: m.completion_tx.clone(),
                         processing: self.processing.clone(),
+                        notify_tx: self.notify_tx.clone(),
                     },
                 ),
                 None => {
                     // Session not registered for processing — clear lock and bail.
-                    self.processing.lock().await.remove(session_db_id);
+                    self.processing.lock().await.active.remove(session_db_id);
                     return Ok(());
                 }
             }
@@ -1999,7 +2068,7 @@ impl Server {
                 agent = %agent.name,
                 "Not home peer for this session/agent; skipping turn"
             );
-            self.processing.lock().await.remove(session_db_id);
+            self.processing.lock().await.active.remove(session_db_id);
             self.record_home_skip(session_db_id, &agent.name).await;
             return Ok(());
         }
@@ -2305,9 +2374,13 @@ impl Server {
             }
             drop(s);
 
-            {
-                let mut proc = spawn.processing.lock().await;
-                proc.remove(&session_db_id);
+            let wake_pending = {
+                let mut state = spawn.processing.lock().await;
+                state.active.remove(&session_db_id);
+                state.pending.contains(&session_db_id)
+            };
+            if wake_pending {
+                let _ = spawn.notify_tx.send(session_db_id.clone()).await;
             }
 
             if let Some(tx) = spawn.completion_tx {

@@ -252,12 +252,28 @@ impl SessionRegistry {
     pub async fn subscribe_new_sessions(&self) -> Option<mpsc::Receiver<NewSessionEvent>> {
         let receiver = self.new_session_rx.lock().await.take()?;
         let sessions = self.list_sessions().await.unwrap_or_default();
-        for session in sessions {
-            let _ = self.new_session_tx.try_send(NewSessionEvent {
-                session_db_id: session.session_db_id,
-                source: session.source,
-            });
-        }
+        // Do not replay through `try_send`: the shared callback queue has a
+        // deliberately small capacity so callbacks never wait on a slow
+        // consumer. A startup catalog larger than that capacity must still
+        // converge. Sending on a detached task preserves callback
+        // responsiveness while applying backpressure only to this durable,
+        // one-off replay; the consumer's `seen` set dedupes overlap with live
+        // notifications.
+        let tx = self.new_session_tx.clone();
+        tokio::spawn(async move {
+            for session in sessions {
+                if tx
+                    .send(NewSessionEvent {
+                        session_db_id: session.session_db_id,
+                        source: session.source,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Some(receiver)
     }
 
@@ -779,6 +795,39 @@ mod tests {
             .expect("session replay channel should remain open");
         assert_eq!(replayed.session_db_id, expected);
         assert_eq!(replayed.source.as_deref(), Some("cli"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_replays_every_session_beyond_channel_capacity() {
+        let (_instance, registry) = make_registry().await;
+        let mut expected = std::collections::HashSet::new();
+        for index in 0..65 {
+            let (_conv, db) = registry
+                .create_session(Some(&format!("replay-{index}")))
+                .await
+                .unwrap();
+            expected.insert(db.root_id().to_string());
+        }
+
+        // Drain live notifications so this assertion exercises the durable
+        // startup replay rather than the creation path.
+        {
+            let mut receiver = registry.new_session_rx.lock().await;
+            let receiver = receiver.as_mut().unwrap();
+            for _ in 0..64 {
+                receiver.recv().await.unwrap();
+            }
+        }
+        let mut receiver = registry.subscribe_new_sessions().await.unwrap();
+        let mut replayed = std::collections::HashSet::new();
+        while replayed.len() < expected.len() {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("replay should continue past channel capacity")
+                .expect("replay channel should remain open");
+            replayed.insert(event.session_db_id);
+        }
+        assert_eq!(replayed, expected);
     }
 
     #[tokio::test]

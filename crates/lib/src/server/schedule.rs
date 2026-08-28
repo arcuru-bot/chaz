@@ -233,7 +233,7 @@ impl Server {
         //    Release at the end of this scope via the deferred block.
         {
             let mut processing = self.processing.lock().await;
-            if !processing.insert(session_db_id.clone()) {
+            if !processing.active.insert(session_db_id.clone()) {
                 tracing::debug!(
                     session = %session_db_id,
                     schedule = %payload.schedule_id,
@@ -257,7 +257,7 @@ impl Server {
         // Release the processing lock.
         {
             let mut processing = self.processing.lock().await;
-            processing.remove(&session_db_id);
+            processing.active.remove(&session_db_id);
         }
 
         // 5. Record ScheduleFire on the agent's DB (best-effort audit).
