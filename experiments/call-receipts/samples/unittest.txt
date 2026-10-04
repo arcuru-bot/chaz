@@ -1,0 +1,32 @@
+test_control_cache_added_to_input_is_caught (test_receipt.NegativeControls.test_control_cache_added_to_input_is_caught) ... 
+    NEGATIVE CONTROL cache_added_to_input on [a]: CAUGHT (1 violation(s)); first: prompt_tokens: receipt total 32300 != oracle 19100
+
+    NEGATIVE CONTROL cache_added_to_input on [c]: CAUGHT (1 violation(s)); first: prompt_tokens: receipt total 28400 != oracle 16300
+ok
+test_control_double_count_is_caught (test_receipt.NegativeControls.test_control_double_count_is_caught) ... 
+    NEGATIVE CONTROL double_count on [a]: CAUGHT (6 violation(s)); first: counted sources ["('att-a2', 'persisted', 0)"] differ from attempts that actually reported usage
+
+    NEGATIVE CONTROL double_count on [c]: CAUGHT (6 violation(s)); first: counted sources ["('att-c1', 'persisted', 0)"] differ from attempts that actually reported usage
+ok
+test_control_unknown_as_zero_is_caught (test_receipt.NegativeControls.test_control_unknown_as_zero_is_caught) ... 
+    NEGATIVE CONTROL unknown_as_zero on [b]: CAUGHT (7 violation(s)); first: counted sources ["('att-b1', 1, 1)", "('att-b1', 1, 2)", "('att-b1', 2, 2)", "('att-b1', 2, 3)"] differ from attempts that actually reported usage
+ok
+test_unknown_as_zero_renders_zero_where_correct_renders_unknown (test_receipt.NegativeControls.test_unknown_as_zero_renders_zero_where_correct_renders_unknown) ... ok
+test_a_completed_retries_not_double_counted (test_receipt.PositiveCases.test_a_completed_retries_not_double_counted) ... 
+    [a] calls=4 http_attempts=6 in=19100 out=985 reported=$0.036435 partial=False
+ok
+test_b_failed_unknown_is_not_zero_and_totals_partial (test_receipt.PositiveCases.test_b_failed_unknown_is_not_zero_and_totals_partial) ... 
+    [b] calls=3 http_attempts=7 in=3000 out=150 reported=$0.001725 partial=True
+ok
+test_c_reported_vs_estimated_never_merged (test_receipt.PositiveCases.test_c_reported_vs_estimated_never_merged) ... 
+    [c] calls=2 http_attempts=2 in=16300 out=550 reported=$0.00398 partial=False
+ok
+test_cli_exit_status_zero (test_receipt.PositiveCases.test_cli_exit_status_zero) ... ok
+test_estimate_precision_is_two_significant_figures (test_receipt.PositiveCases.test_estimate_precision_is_two_significant_figures) ... ok
+
+NEGATIVE CONTROL SUMMARY: 5/5 broken runs caught across 3 controls
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.004s
+
+OK

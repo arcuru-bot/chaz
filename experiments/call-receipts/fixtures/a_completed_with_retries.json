@@ -1,0 +1,152 @@
+{
+  "_synthetic": "SYNTHETIC FIXTURE. Illustrative format only, not a production schema. All ids, models, providers, token counts and money values are invented.",
+  "example": "a",
+  "title": "Completed turn: interrupted first attempt, retried second attempt with HTTP retries",
+  "request_id": "req-a",
+  "rate_card_illustrative": {},
+  "turn_attempts": [
+    {
+      "attempt_id": "att-a1",
+      "generation": 1,
+      "status": "interrupted",
+      "started_at": "2026-01-01T10:00:00Z",
+      "completed_at": null,
+      "persisted_turn_metadata": null,
+      "calls": [
+        {
+          "model_sequence": 0,
+          "terminal": false,
+          "http_attempts": [
+            {
+              "n": 1,
+              "outcome": "ok",
+              "model": "example/model-large",
+              "provider": "ExampleCloud",
+              "response_id": "resp-a1-0",
+              "latency_ms": 2300,
+              "usage": {
+                "prompt_tokens": 4200,
+                "completion_tokens": 180,
+                "total_tokens": 4380,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "cost_usd": "0.0153"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "attempt_id": "att-a2",
+      "generation": 2,
+      "status": "completed",
+      "started_at": "2026-01-01T10:05:00Z",
+      "completed_at": "2026-01-01T10:05:41Z",
+      "persisted_turn_metadata": {
+        "model": "example/model-large",
+        "prompt_tokens": 14900,
+        "completion_tokens": 805,
+        "total_tokens": 15705,
+        "cached_tokens": 13200,
+        "reasoning_tokens": 64,
+        "cost_usd": "0.021135",
+        "context_tokens": 5600
+      },
+      "calls": [
+        {
+          "model_sequence": 0,
+          "terminal": false,
+          "http_attempts": [
+            {
+              "n": 1,
+              "outcome": "rate_limited",
+              "latency_ms": 300,
+              "backoff_ms": 1000
+            },
+            {
+              "n": 2,
+              "outcome": "ok",
+              "model": "example/model-large",
+              "provider": "ExampleCloud",
+              "response_id": "resp-a2-0",
+              "latency_ms": 2100,
+              "usage": {
+                "prompt_tokens": 4200,
+                "completion_tokens": 175,
+                "total_tokens": 4375,
+                "cached_tokens": 3900,
+                "reasoning_tokens": 0,
+                "cost_usd": "0.004695"
+              }
+            }
+          ]
+        },
+        {
+          "model_sequence": 1,
+          "terminal": false,
+          "http_attempts": [
+            {
+              "n": 1,
+              "outcome": "ok",
+              "model": "example/model-large",
+              "provider": "ExampleCloud",
+              "response_id": "resp-a2-1",
+              "latency_ms": 3400,
+              "usage": {
+                "prompt_tokens": 5100,
+                "completion_tokens": 220,
+                "total_tokens": 5320,
+                "cached_tokens": 4200,
+                "reasoning_tokens": 64,
+                "cost_usd": "0.00726"
+              }
+            }
+          ]
+        },
+        {
+          "model_sequence": 2,
+          "terminal": true,
+          "http_attempts": [
+            {
+              "n": 1,
+              "outcome": "server_error",
+              "latency_ms": 150,
+              "backoff_ms": 1000
+            },
+            {
+              "n": 2,
+              "outcome": "ok",
+              "model": "example/model-large",
+              "provider": "ExampleCloud",
+              "response_id": "resp-a2-2",
+              "latency_ms": 5200,
+              "usage": {
+                "prompt_tokens": 5600,
+                "completion_tokens": 410,
+                "total_tokens": 6010,
+                "cached_tokens": 5100,
+                "reasoning_tokens": 0,
+                "cost_usd": "0.00918"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "expected_hand_computed": {
+    "model_calls": 4,
+    "http_attempts": 6,
+    "retried_http_attempts": 2,
+    "unavailable": 0,
+    "not_applicable": 2,
+    "partial": false,
+    "prompt_tokens": 19100,
+    "completion_tokens": 985,
+    "cached_tokens": 13200,
+    "reasoning_tokens": 64,
+    "cost_reported": "0.036435",
+    "cost_estimated": null
+  }
+}

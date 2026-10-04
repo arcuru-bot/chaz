@@ -1,0 +1,28 @@
+SYNTHETIC DATA ONLY. Money values are illustrative; this is not a billing ledger.
+
+[a] Completed turn: interrupted first attempt, retried second attempt with HTTP retries
+    request req-a | 2 turn attempt(s) | 4 model call(s) | 6 HTTP attempt(s), 2 retried
+    tokens  in 19.1k (of which 13.2k cache-read) | out 985 (of which 64 reasoning)
+    cost    $0.036435 reported (4 call(s))
+    elapsed gen 1 unavailable (interrupted); gen 2 41s (completed) [S wall clock incl. tools/backoff]
+    today   [S-modeled /info + TUI fold] 1 call | 14900 prompt + 805 completion (13200 cached) | $0.0211
+    check   OK
+
+[b] Failed turn: timeouts, a success with no usage block, retries exhausted
+    request req-b | 1 turn attempt(s) | 3 model call(s) | 7 HTTP attempt(s), 4 retried
+    tokens  in >=3.0k | out >=150
+    PARTIAL: usage unavailable for 4 of 7 HTTP attempt(s); totals are lower bounds
+    cost    >=$0.001725 reported (1 call(s)) + unknown for 4 attempt(s)
+    elapsed gen 1 380s (failed) [S wall clock incl. tools/backoff]
+    today   [S-modeled /info + TUI fold] nothing: no Message entry with metadata (failed/interrupted attempts write none)
+    check   OK
+
+[c] Provider-specific usage: normalization, a hypothetical correction, and an estimate
+    request req-c | 1 turn attempt(s) | 2 model call(s) | 2 HTTP attempt(s), 0 retried
+    tokens  in 16.3k (of which 12.1k cache-read, 1.5k cache-write) | out 550
+    cost    >=$0.00398 reported (1 call(s), 1 corrected [H]) + ~$0.0087 est. (1 call(s), illustrative rate card [M])
+    elapsed gen 1 9s (completed) [S wall clock incl. tools/backoff]
+    today   [S-modeled /info + TUI fold] 1 call | 16300 prompt + 550 completion (12100 cached) | $0.0042
+    check   OK
+
+3 receipt(s), 0 invariant failure(s)

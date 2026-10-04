@@ -1,0 +1,103 @@
+{
+  "_synthetic": "SYNTHETIC FIXTURE. Illustrative format only, not a production schema. All ids, models, providers, token counts and money values are invented.",
+  "example": "b",
+  "title": "Failed turn: timeouts, a success with no usage block, retries exhausted",
+  "request_id": "req-b",
+  "rate_card_illustrative": {},
+  "turn_attempts": [
+    {
+      "attempt_id": "att-b1",
+      "generation": 1,
+      "status": "failed",
+      "started_at": "2026-01-01T11:00:00Z",
+      "completed_at": "2026-01-01T11:06:20Z",
+      "persisted_turn_metadata": null,
+      "calls": [
+        {
+          "model_sequence": 0,
+          "terminal": false,
+          "http_attempts": [
+            {
+              "n": 1,
+              "outcome": "ok",
+              "model": "example/model-small",
+              "provider": "OtherHost",
+              "response_id": "resp-b1-0",
+              "latency_ms": 2000,
+              "usage": {
+                "prompt_tokens": 3000,
+                "completion_tokens": 150,
+                "total_tokens": 3150,
+                "cost_usd": "0.001725"
+              }
+            }
+          ]
+        },
+        {
+          "model_sequence": 1,
+          "terminal": false,
+          "http_attempts": [
+            {
+              "n": 1,
+              "outcome": "timeout",
+              "latency_ms": 120000,
+              "backoff_ms": 1000
+            },
+            {
+              "n": 2,
+              "outcome": "ok",
+              "model": "example/model-small",
+              "provider": "OtherHost",
+              "response_id": "resp-b1-1",
+              "latency_ms": 2500,
+              "usage": null
+            }
+          ]
+        },
+        {
+          "model_sequence": 2,
+          "terminal": false,
+          "http_attempts": [
+            {
+              "n": 1,
+              "outcome": "server_error",
+              "latency_ms": 200,
+              "backoff_ms": 1000
+            },
+            {
+              "n": 2,
+              "outcome": "timeout",
+              "latency_ms": 120000,
+              "backoff_ms": 2000
+            },
+            {
+              "n": 3,
+              "outcome": "timeout",
+              "latency_ms": 120000,
+              "backoff_ms": 4000
+            },
+            {
+              "n": 4,
+              "outcome": "server_error",
+              "latency_ms": 300
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "expected_hand_computed": {
+    "model_calls": 3,
+    "http_attempts": 7,
+    "retried_http_attempts": 4,
+    "unavailable": 4,
+    "not_applicable": 2,
+    "partial": true,
+    "prompt_tokens": 3000,
+    "completion_tokens": 150,
+    "cached_tokens": null,
+    "reasoning_tokens": null,
+    "cost_reported": "0.001725",
+    "cost_estimated": null
+  }
+}

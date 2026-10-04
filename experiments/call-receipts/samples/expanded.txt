@@ -1,0 +1,68 @@
+SYNTHETIC DATA ONLY. Money values are illustrative; this is not a billing ledger.
+
+[a] Completed turn: interrupted first attempt, retried second attempt with HTTP retries
+    request req-a | 2 turn attempt(s) | 4 model call(s) | 6 HTTP attempt(s), 2 retried
+    tokens  in 19.1k (of which 13.2k cache-read) | out 985 (of which 64 reasoning)
+    cost    $0.036435 reported (4 call(s))
+    elapsed gen 1 unavailable (interrupted); gen 2 41s (completed) [S wall clock incl. tools/backoff]
+    today   [S-modeled /info + TUI fold] 1 call | 14900 prompt + 805 completion (13200 cached) | $0.0211
+
+    turn attempt att-a1 gen 1 [S]: interrupted, elapsed unavailable
+      gen.seq.try outcome       usage           in  c-read c-write   out  reas  cost                     latency[H]
+      #1.0.1      ok            reported     4,200       0       -   180     0  $0.0153 reported            2,300ms
+    turn attempt att-a2 gen 2 [S]: completed, elapsed 41s
+      gen.seq.try outcome       usage           in  c-read c-write   out  reas  cost                     latency[H]
+      #2.0.1      rate_limited  n/a [M]        n/a     n/a     n/a   n/a   n/a  n/a [M]                       300ms
+                  then backoff 1,000ms [H: only in warn! log today]
+      #2.0.2      ok            reported     4,200   3,900       -   175     0  $0.004695 reported          2,100ms
+      #2.1.1      ok            reported     5,100   4,200       -   220    64  $0.00726 reported           3,400ms
+      #2.2.1      server_error  n/a [M]        n/a     n/a     n/a   n/a   n/a  n/a [M]                       150ms
+                  then backoff 1,000ms [H: only in warn! log today]
+      #2.2.2      ok            reported     5,600   5,100       -   410     0  $0.00918 reported           5,200ms
+      persisted turn metadata [S] (SessionEntry.metadata): in 14,900 out 805 cost $0.021135 model example/model-large -> equals this attempt's per-call sum: yes (cross-check only, not added)
+    legend: [S] persisted today  [H] hypothetical, not persisted  [M] modeled assumption; '?'/unavail. = unknown, never 0
+    check   OK
+
+[b] Failed turn: timeouts, a success with no usage block, retries exhausted
+    request req-b | 1 turn attempt(s) | 3 model call(s) | 7 HTTP attempt(s), 4 retried
+    tokens  in >=3.0k | out >=150
+    PARTIAL: usage unavailable for 4 of 7 HTTP attempt(s); totals are lower bounds
+    cost    >=$0.001725 reported (1 call(s)) + unknown for 4 attempt(s)
+    elapsed gen 1 380s (failed) [S wall clock incl. tools/backoff]
+    today   [S-modeled /info + TUI fold] nothing: no Message entry with metadata (failed/interrupted attempts write none)
+
+    turn attempt att-b1 gen 1 [S]: failed, elapsed 380s
+      gen.seq.try outcome       usage           in  c-read c-write   out  reas  cost                     latency[H]
+      #1.0.1      ok            reported     3,000       -       -   150     -  $0.001725 reported          2,000ms
+      #1.1.1      timeout       unavail.  unavail.       ?       ?     ?     ?  unknown                   120,000ms
+                  then backoff 1,000ms [H: only in warn! log today]
+      #1.1.2      ok            unavail.  unavail.       ?       ?     ?     ?  unknown                     2,500ms
+                  today: response had no usage block; build_metadata stores usage.unwrap_or_default() -> recorded as 0 tokens [S]
+      #1.2.1      server_error  n/a [M]        n/a     n/a     n/a   n/a   n/a  n/a [M]                       200ms
+                  then backoff 1,000ms [H: only in warn! log today]
+      #1.2.2      timeout       unavail.  unavail.       ?       ?     ?     ?  unknown                   120,000ms
+                  then backoff 2,000ms [H: only in warn! log today]
+      #1.2.3      timeout       unavail.  unavail.       ?       ?     ?     ?  unknown                   120,000ms
+                  then backoff 4,000ms [H: only in warn! log today]
+      #1.2.4      server_error  n/a [M]        n/a     n/a     n/a   n/a   n/a  n/a [M]                       300ms
+    legend: [S] persisted today  [H] hypothetical, not persisted  [M] modeled assumption; '?'/unavail. = unknown, never 0
+    check   OK
+
+[c] Provider-specific usage: normalization, a hypothetical correction, and an estimate
+    request req-c | 1 turn attempt(s) | 2 model call(s) | 2 HTTP attempt(s), 0 retried
+    tokens  in 16.3k (of which 12.1k cache-read, 1.5k cache-write) | out 550
+    cost    >=$0.00398 reported (1 call(s), 1 corrected [H]) + ~$0.0087 est. (1 call(s), illustrative rate card [M])
+    elapsed gen 1 9s (completed) [S wall clock incl. tools/backoff]
+    today   [S-modeled /info + TUI fold] 1 call | 16300 prompt + 550 completion (12100 cached) | $0.0042
+
+    turn attempt att-c1 gen 1 [S]: completed, elapsed 9s
+      gen.seq.try outcome       usage           in  c-read c-write   out  reas  cost                     latency[H]
+      #1.0.1      ok            reported     8,000   4,700   1,500   300     -  $0.00398 corr[H] was $0.004215    3,100ms
+                  note: openrouter cached_tokens 6,200 includes 1,500 cache writes -> 4,700 cache reads (same back-out as openai.rs)
+      #1.1.1      ok            reported     8,300   7,400       0   250     -  ~$0.0087 est.[M]            4,200ms
+                  note: anthropic input_tokens 900 excludes cache; folded to prompt 8,300 (same as anthropic.rs); no cost reported
+      persisted turn metadata [S] (SessionEntry.metadata): in 16,300 out 550 cost $0.004215 model example/model-large-direct -> equals this attempt's per-call sum: yes (cross-check only, not added)
+    legend: [S] persisted today  [H] hypothetical, not persisted  [M] modeled assumption; '?'/unavail. = unknown, never 0
+    check   OK
+
+3 receipt(s), 0 invariant failure(s)

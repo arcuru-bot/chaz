@@ -1,0 +1,100 @@
+{
+  "_synthetic": "SYNTHETIC FIXTURE. Illustrative format only, not a production schema. All ids, models, providers, token counts, rates and money values are invented.",
+  "example": "c",
+  "title": "Provider-specific usage: normalization, a hypothetical correction, and an estimate",
+  "request_id": "req-c",
+  "rate_card_illustrative": {
+    "_note": "ILLUSTRATIVE rates in USD per million tokens. Not real prices. Used only to show how an estimate is labelled.",
+    "example/model-large-direct": {
+      "input_uncached": "3.00",
+      "cache_read": "0.30",
+      "cache_write": "3.75",
+      "output": "15.00"
+    }
+  },
+  "turn_attempts": [
+    {
+      "attempt_id": "att-c1",
+      "generation": 1,
+      "status": "completed",
+      "started_at": "2026-01-01T12:00:00Z",
+      "completed_at": "2026-01-01T12:00:09Z",
+      "persisted_turn_metadata": {
+        "model": "example/model-large-direct",
+        "prompt_tokens": 16300,
+        "completion_tokens": 550,
+        "total_tokens": 16850,
+        "cached_tokens": 12100,
+        "cache_creation_tokens": 1500,
+        "cost_usd": "0.004215",
+        "context_tokens": 8300
+      },
+      "calls": [
+        {
+          "model_sequence": 0,
+          "terminal": false,
+          "http_attempts": [
+            {
+              "n": 1,
+              "outcome": "ok",
+              "wire": "openrouter",
+              "model": "example/model-large",
+              "provider": "ExampleCloud",
+              "response_id": "resp-c1-0",
+              "latency_ms": 3100,
+              "raw_usage": {
+                "prompt_tokens": 8000,
+                "completion_tokens": 300,
+                "total_tokens": 8300,
+                "prompt_tokens_details": {
+                  "cached_tokens": 6200,
+                  "cache_write_tokens": 1500
+                },
+                "cost": "0.004215"
+              },
+              "correction_hypothetical": {
+                "cost_usd": "0.00398",
+                "source": "HYPOTHETICAL later provider reconciliation; no such field or fetch exists in chaz"
+              }
+            }
+          ]
+        },
+        {
+          "model_sequence": 1,
+          "terminal": true,
+          "http_attempts": [
+            {
+              "n": 1,
+              "outcome": "ok",
+              "wire": "anthropic",
+              "model": "example/model-large-direct",
+              "provider": null,
+              "response_id": "resp-c1-1",
+              "latency_ms": 4200,
+              "raw_usage": {
+                "input_tokens": 900,
+                "output_tokens": 250,
+                "cache_read_input_tokens": 7400,
+                "cache_creation_input_tokens": 0
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "expected_hand_computed": {
+    "model_calls": 2,
+    "http_attempts": 2,
+    "retried_http_attempts": 0,
+    "unavailable": 0,
+    "not_applicable": 0,
+    "partial": false,
+    "prompt_tokens": 16300,
+    "completion_tokens": 550,
+    "cached_tokens": 12100,
+    "cache_creation_tokens": 1500,
+    "cost_reported": "0.00398",
+    "cost_estimated": "0.0087"
+  }
+}
